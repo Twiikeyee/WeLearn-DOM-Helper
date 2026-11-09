@@ -1,0 +1,17 @@
+{
+  "username": "",
+  "password": "",
+  "url": "https://welearn.sflep.com/2019/student/index.aspx",
+  "api_key": "",
+  "base_url": "https://api.openai.com/v1",
+  "model": "gpt-4o-mini",
+  "temperature": 0.3,
+  "max_tokens": 4096,
+  "min_dwell_seconds": 5,
+  "browser": "edge",
+  "headless": false,
+  "debug_mode": false,
+  "tts_engine": "auto",
+  "tts_voice": "",
+  "tts_proxy": ""
+}

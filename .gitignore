@@ -1,0 +1,28 @@
+# Configuration with sensitive API keys or credentials
+config.json
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Logs & temp
+logs/
+*.log
+tmp/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
