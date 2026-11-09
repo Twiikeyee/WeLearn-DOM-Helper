@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 DEFAULT_WELEARN_URL = "https://welearn.sflep.com/2019/student/index.aspx"
+DEFAULT_SUBJECTIVE_TEXT = (
+    "From my perspective, this viewpoint is quite reasonable and closely "
+    "related to our daily study, communication, and practical experiences."
+)
 
 
 @dataclass
@@ -21,15 +25,26 @@ class Config:
     username: str = ""
     password: str = ""
     url: str = DEFAULT_WELEARN_URL
+    
+    # Typing & Speed
+    typing_mode: str = "fast"  # "fast" (instant JS injection) or "simulate" (human keystrokes)
+    min_dwell_seconds: int = 0  # 0 for max speed, or set > 0 if teacher requires minimum study time
+    
+    # LLM Settings
+    enable_llm_subjective: bool = False  # False for 0-token free mode with default template
+    subjective_default_text: str = DEFAULT_SUBJECTIVE_TEXT
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4o-mini"
     temperature: float = 0.3
     max_tokens: int = 4096
-    min_dwell_seconds: int = 5
+    
+    # Browser & Runtime
     browser: str = "edge"
     headless: bool = False
     debug_mode: bool = False
+    
+    # TTS
     tts_engine: str = "auto"
     tts_voice: str = ""
     tts_proxy: str = ""
@@ -54,12 +69,17 @@ class Config:
             username=str(data.get("username", "") or "").strip(),
             password=str(data.get("password", "") or "").strip(),
             url=str(data.get("url", "") or DEFAULT_WELEARN_URL).strip(),
+            typing_mode=str(data.get("typing_mode", "fast") or "fast").strip().lower(),
+            min_dwell_seconds=int(data.get("min_dwell_seconds", 0)),
+            enable_llm_subjective=bool(data.get("enable_llm_subjective", False)),
+            subjective_default_text=str(
+                data.get("subjective_default_text", DEFAULT_SUBJECTIVE_TEXT) or DEFAULT_SUBJECTIVE_TEXT
+            ).strip(),
             api_key=str(data.get("api_key", "") or "").strip(),
             base_url=str(data.get("base_url", "https://api.openai.com/v1") or "").strip(),
             model=str(data.get("model", "gpt-4o-mini") or "").strip(),
             temperature=float(data.get("temperature", 0.3)),
             max_tokens=int(data.get("max_tokens", 4096)),
-            min_dwell_seconds=int(data.get("min_dwell_seconds", 5)),
             browser=str(data.get("browser", "edge") or "edge").strip().lower(),
             headless=bool(data.get("headless", False)),
             debug_mode=bool(data.get("debug_mode", False)),
@@ -73,12 +93,15 @@ class Config:
             "username": self.username,
             "password": self.password,
             "url": self.url,
+            "typing_mode": self.typing_mode,
+            "min_dwell_seconds": self.min_dwell_seconds,
+            "enable_llm_subjective": self.enable_llm_subjective,
+            "subjective_default_text": self.subjective_default_text,
             "api_key": self.api_key,
             "base_url": self.base_url,
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "min_dwell_seconds": self.min_dwell_seconds,
             "browser": self.browser,
             "headless": self.headless,
             "debug_mode": self.debug_mode,

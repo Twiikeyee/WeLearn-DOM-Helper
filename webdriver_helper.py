@@ -32,7 +32,7 @@ class WebDriverHelper:
     @staticmethod
     def human_like_delay(base_delay: float = 0.2) -> None:
         """Introduce a slight randomized delay mimicking human interaction."""
-        delay = max(0.05, base_delay * (0.8 + random.random() * 0.4))
+        delay = max(0.02, base_delay * (0.8 + random.random() * 0.4))
         time.sleep(delay)
 
     @staticmethod
@@ -93,7 +93,7 @@ class WebDriverHelper:
                     "arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});",
                     element,
                 )
-                time.sleep(0.2)
+                time.sleep(0.15)
 
                 try:
                     element.click()
@@ -102,14 +102,43 @@ class WebDriverHelper:
                 return True
             except StaleElementReferenceException:
                 if i < retries - 1:
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     continue
             except Exception as e:
                 if i < retries - 1:
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     continue
                 logger.debug("safe_click failed: %s", e)
         return False
+
+    @staticmethod
+    def fast_fill(driver, element, text: str) -> None:
+        """Instantly inject text into input/textarea and trigger all binding events (0ms delay)."""
+        if element is None or text is None:
+            return
+
+        try:
+            driver.execute_script(
+                """
+                var el = arguments[0];
+                var val = arguments[1];
+                el.scrollIntoView({block: 'center', behavior: 'instant'});
+                el.focus();
+                el.value = val;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+                """,
+                element,
+                str(text),
+            )
+        except Exception as e:
+            logger.debug("fast_fill failed via JS, falling back to clear+send_keys: %s", e)
+            try:
+                element.clear()
+                element.send_keys(str(text))
+            except Exception:
+                pass
 
     @staticmethod
     def simulate_typing(driver, element, text: str) -> None:
@@ -134,28 +163,26 @@ class WebDriverHelper:
             except Exception:
                 pass
 
-        WebDriverHelper.human_like_delay(0.1)
+        WebDriverHelper.human_like_delay(0.05)
 
         try:
             element.clear()
         except Exception:
             pass
 
-        WebDriverHelper.human_like_delay(0.1)
+        WebDriverHelper.human_like_delay(0.05)
 
         for char in str(text):
             try:
                 element.send_keys(char)
             except Exception:
-                # If send_keys fails (e.g. non-BMP chars), set value directly
                 driver.execute_script(
                     "arguments[0].value = (arguments[0].value || '') + arguments[1];",
                     element,
                     char,
                 )
-            time.sleep(random.uniform(0.015, 0.05))
+            time.sleep(random.uniform(0.015, 0.04))
 
-        # Dispatch standard input/change/blur events to notify page scripts
         try:
             driver.execute_script(
                 """
@@ -169,4 +196,4 @@ class WebDriverHelper:
         except Exception:
             pass
 
-        WebDriverHelper.human_like_delay(0.1)
+        WebDriverHelper.human_like_delay(0.05)

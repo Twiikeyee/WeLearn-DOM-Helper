@@ -21,8 +21,10 @@ class TestConfig(unittest.TestCase):
     def test_default_config(self):
         cfg = Config()
         self.assertEqual(cfg.browser, "edge")
-        self.assertEqual(cfg.min_dwell_seconds, 5)
-        self.assertEqual(cfg.model, "gpt-4o-mini")
+        self.assertEqual(cfg.min_dwell_seconds, 0)
+        self.assertEqual(cfg.typing_mode, "fast")
+        self.assertFalse(cfg.enable_llm_subjective)
+        self.assertTrue(len(cfg.subjective_default_text) > 0)
 
     def test_save_and_load_config(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
@@ -32,16 +34,20 @@ class TestConfig(unittest.TestCase):
             cfg = Config(
                 username="test_user",
                 password="test_password",
+                typing_mode="simulate",
+                min_dwell_seconds=3,
+                enable_llm_subjective=True,
                 api_key="sk-testkey123",
-                min_dwell_seconds=8,
             )
             cfg.save_json(temp_path)
 
             loaded = Config.from_json(temp_path)
             self.assertEqual(loaded.username, "test_user")
             self.assertEqual(loaded.password, "test_password")
+            self.assertEqual(loaded.typing_mode, "simulate")
+            self.assertEqual(loaded.min_dwell_seconds, 3)
+            self.assertTrue(loaded.enable_llm_subjective)
             self.assertEqual(loaded.api_key, "sk-testkey123")
-            self.assertEqual(loaded.min_dwell_seconds, 8)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -97,7 +103,7 @@ class TestWeLearnPlayer(unittest.TestCase):
 
 class TestQuestionSolver(unittest.TestCase):
     def setUp(self):
-        self.cfg = Config(min_dwell_seconds=1)
+        self.cfg = Config(min_dwell_seconds=0, typing_mode="fast", enable_llm_subjective=False)
         self.mock_ai = MagicMock(spec=OpenAICompatibleClient)
         self.mock_ai.is_available.return_value = True
         self.mock_ai.solve_subjective_question.return_value = "Generated subjective answer"
@@ -107,7 +113,6 @@ class TestQuestionSolver(unittest.TestCase):
         mock_driver = MagicMock()
         mock_scope = MagicMock()
 
-        # Create choice container with 4 options; option 2 has data-solution=""
         mock_container = MagicMock()
         mock_opt1 = MagicMock()
         mock_opt1.get_attribute.return_value = None
@@ -116,10 +121,7 @@ class TestQuestionSolver(unittest.TestCase):
         mock_opt2.get_attribute.side_effect = lambda attr: "" if attr == "data-solution" else None
         mock_opt2.text = "Option B"
 
-        mock_opt3 = MagicMock()
-        mock_opt3.get_attribute.return_value = None
-
-        mock_container.find_elements.return_value = [mock_opt1, mock_opt2, mock_opt3]
+        mock_container.find_elements.return_value = [mock_opt1, mock_opt2]
         mock_scope.find_elements.return_value = [mock_container]
 
         with patch.object(WebDriverHelper, "safe_click") as mock_click:
@@ -127,21 +129,20 @@ class TestQuestionSolver(unittest.TestCase):
             self.assertEqual(count, 1)
             mock_click.assert_called_with(mock_driver, mock_opt2)
 
-    def test_solve_objective_fillings_dom_native(self):
+    def test_solve_objective_fillings_fast_fill(self):
         mock_driver = MagicMock()
         mock_scope = MagicMock()
 
         mock_inp = MagicMock()
         mock_inp.get_attribute.side_effect = lambda attr: "eighteen/18" if attr == "data-solution" else None
-
         mock_scope.find_elements.return_value = [mock_inp]
 
-        with patch.object(WebDriverHelper, "simulate_typing") as mock_type:
+        with patch.object(WebDriverHelper, "fast_fill") as mock_fast:
             count = self.solver._solve_objective_fillings(mock_driver, mock_scope)
             self.assertEqual(count, 1)
-            mock_type.assert_called_with(mock_driver, mock_inp, "eighteen")
+            mock_fast.assert_called_with(mock_driver, mock_inp, "eighteen")
 
-    def test_solve_subjective_fillings_llm(self):
+    def test_solve_subjective_zero_token_mode(self):
         mock_driver = MagicMock()
         mock_scope = MagicMock()
 
@@ -153,11 +154,32 @@ class TestQuestionSolver(unittest.TestCase):
 
         mock_scope.find_elements.return_value = [mock_container]
 
-        with patch.object(WebDriverHelper, "simulate_typing") as mock_type:
+        with patch.object(WebDriverHelper, "fast_fill") as mock_fast:
+            # When enable_llm_subjective is False, it should NOT call AI client!
+            count = self.solver._solve_subjective_fillings(mock_driver, mock_scope)
+            self.assertEqual(count, 1)
+            self.mock_ai.solve_subjective_question.assert_not_called()
+            mock_fast.assert_called_with(mock_driver, mock_textarea, self.cfg.subjective_default_text)
+
+    def test_solve_subjective_llm_mode(self):
+        mock_driver = MagicMock()
+        mock_scope = MagicMock()
+
+        self.solver.config.enable_llm_subjective = True
+
+        mock_container = MagicMock()
+        mock_textarea = MagicMock()
+        mock_textarea.get_attribute.return_value = None
+        mock_container.get_attribute.return_value = None
+        mock_container.find_elements.return_value = [mock_textarea]
+
+        mock_scope.find_elements.return_value = [mock_container]
+
+        with patch.object(WebDriverHelper, "fast_fill") as mock_fast:
             count = self.solver._solve_subjective_fillings(mock_driver, mock_scope)
             self.assertEqual(count, 1)
             self.mock_ai.solve_subjective_question.assert_called()
-            mock_type.assert_called_with(mock_driver, mock_textarea, "Generated subjective answer")
+            mock_fast.assert_called_with(mock_driver, mock_textarea, "Generated subjective answer")
 
 
 if __name__ == "__main__":
