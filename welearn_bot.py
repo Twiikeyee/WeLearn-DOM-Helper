@@ -152,8 +152,10 @@ class DurationPlanner:
             weights.append(max(0.1, scarcity_factor * jitter))
 
         weight_sum = sum(weights)
-        raw_shares = [(w / weight_sum) * net_needed for w in weights]
-        int_shares = [int(s) for s in raw_shares]
+        base_per_task = 1 if net_needed >= n else 0
+        distributable = net_needed - (base_per_task * n)
+        raw_shares = [(w / weight_sum) * distributable for w in weights]
+        int_shares = [base_per_task + int(s) for s in raw_shares]
         remainder = net_needed - sum(int_shares)
 
         # Distribute integer remainder to items with largest fractional part
@@ -200,7 +202,7 @@ class WeLearnBot:
         self.units_cache: List[WeLearnUnit] = []
         self.all_tasks_cache: List[Dict] = []
 
-    def reload_config(self, path: str = "config.json") -> Config:
+    def reload_config(self, path: Optional[str] = None) -> Config:
         """Reload runtime configuration from disk and sync with solver."""
         try:
             self.config = Config.from_json(path)
@@ -518,8 +520,25 @@ class WeLearnBot:
             selected_tabs=selected_tabs,
             target_total_seconds=target_total,
             min_dwell_seconds=min_dwell,
-            all_course_tabs=self.all_tasks_cache if self.all_tasks_cache else None,
+            all_course_tabs=None,
         )
+
+        # If user set target_total > 0, but the selected tasks already have learned time close to or exceeding
+        # target_total (leaving < 25% of target_total or < 2s per task), treat target_total as the net
+        # additional duration to distribute across the selected tasks rather than silently assigning ~0s.
+        min_meaningful_net = max(len(selected_tabs) * 2, int(target_total * 0.25))
+        if target_total > 0 and summary["net_needed_seconds"] < min_meaningful_net:
+            already_sel = summary["already_learned_seconds"]
+            self._ui_log(
+                f"提示: 当前选中任务已有累计时长 ({already_sel}s) 已接近或达到目标值 ({target_total}s)，"
+                f"将按目标值净增 {target_total}s 随机分摊至各选中小节。"
+            )
+            allocations, summary = DurationPlanner.plan_dwell_allocations(
+                selected_tabs=selected_tabs,
+                target_total_seconds=already_sel + target_total,
+                min_dwell_seconds=min_dwell,
+                all_course_tabs=None,
+            )
 
         mode_names = {
             "serial": "串联顺序模式 (Serial)",
@@ -616,14 +635,15 @@ class WeLearnBot:
         """
         num_workers = min(max_tabs, len(selected_tabs))
         avg_dwell = sum(allocations) / max(1, len(allocations))
-        # Adaptive stagger so short tests finish quickly while long sessions space out naturally
-        base_ramp_delay = min(15.0, max(0.25, avg_dwell * 0.18))
-        base_submit_gap = min(45.0, max(0.35, avg_dwell * 0.22))
+        # Navigation + DOM answer filling already takes ~2.5-3.5s of natural stagger per tab;
+        # keep extra post-launch pause compact so all worker tabs populate promptly in parallel.
+        base_ramp_delay = min(2.0, max(0.2, avg_dwell * 0.05))
+        base_submit_gap = min(20.0, max(0.35, avg_dwell * 0.15))
 
         base_handle, worker_handles = self._acquire_worker_tabs(num_workers)
         self._ui_log(
             f"[流水线并发] 已就绪 {len(worker_handles)} 个并发标签页 "
-            f"(错峰发车间隔 ~{base_ramp_delay:.1f}s, 保序提交最小间隔 ~{base_submit_gap:.1f}s)"
+            f"(错峰发车附加间隔 ~{base_ramp_delay:.1f}s, 保序提交最小间隔 ~{base_submit_gap:.1f}s)"
         )
 
         # active_slots maps window_handle -> slot metadata dict
@@ -633,6 +653,7 @@ class WeLearnBot:
         next_submit_seq = 0
         last_launch_ts = 0.0
         last_submit_ts = 0.0
+        rr_cursor = 0
         total_tasks = len(selected_tabs)
 
         try:
@@ -643,14 +664,23 @@ class WeLearnBot:
                 while next_submit_seq in skipped_seqs:
                     next_submit_seq += 1
 
-                # 2. Launch next task into an idle tab if ramp-up stagger allows
+                # 2. Launch next task into an idle tab (round-robin across worker_handles)
                 free_handles = [h for h in worker_handles if h not in active_slots]
                 if (
                     free_handles
                     and next_launch_idx < total_tasks
                     and (last_launch_ts == 0.0 or (now - last_launch_ts) >= base_ramp_delay)
                 ):
-                    handle = free_handles[0]
+                    handle = None
+                    for offset in range(len(worker_handles)):
+                        cand = worker_handles[(rr_cursor + offset) % len(worker_handles)]
+                        if cand not in active_slots:
+                            handle = cand
+                            rr_cursor = (rr_cursor + offset + 1) % len(worker_handles)
+                            break
+                    if handle is None:
+                        handle = free_handles[0]
+
                     seq_idx = next_launch_idx
                     next_launch_idx += 1
                     tab = selected_tabs[seq_idx]
@@ -684,6 +714,7 @@ class WeLearnBot:
                             elapsed = stats.get("elapsed_solving", 0.0)
 
                         rem_wait = max(0.0, alloc_dwell - elapsed)
+                        now_after = time.time()
                         active_slots[handle] = {
                             "seq_idx": seq_idx,
                             "tab": tab,
@@ -691,14 +722,30 @@ class WeLearnBot:
                             "disp_name": disp_name,
                             "tab_no": tab_no,
                             "alloc_dwell": alloc_dwell,
-                            "ready_at": time.time() + rem_wait,
+                            "ready_at": now_after + rem_wait,
+                            "last_ping": now_after,
                         }
-                        last_launch_ts = time.time()
+                        last_launch_ts = now_after
+                        # Ensure the initial wave populates all worker tabs before starting submissions
+                        if next_launch_idx < num_workers and len(active_slots) < num_workers:
+                            time.sleep(base_ramp_delay)
+                            continue
                     except Exception as e:
                         self._ui_log(f"   [Tab {tab_no}] 发车异常 ({scoid}): {e}")
                         logger.error("Pipeline launch error on %s: %s", scoid, e, exc_info=True)
                         skipped_seqs.add(seq_idx)
                         continue
+
+                # 2b. Periodically ping long-dwelling tabs so background timers stay active
+                now = time.time()
+                for h, slot in list(active_slots.items()):
+                    if now - slot.get("last_ping", now) >= 25.0 and slot["ready_at"] - now > 3.0:
+                        try:
+                            self.driver.switch_to.window(h)
+                            WeLearnPlayer.keep_tab_alive(self.driver)
+                        except Exception:
+                            pass
+                        slot["last_ping"] = time.time()
 
                 # 3. Ordered Submission Gate: check if the slot with `next_submit_seq` is ready to submit
                 target_handle = None
@@ -779,8 +826,7 @@ class WeLearnBot:
                 continue
 
             # Brief dwell during Phase 1 so sequential submit timestamps are naturally spaced
-            phase1_wait = min(alloc_dwell, 1.5)
-            t0 = time.time()
+            phase1_wait = min(alloc_dwell * 0.25, 1.0)
             self._ui_log(f"[{idx + 1}/{total_tasks}] [阶段1-顺序作答] {disp_name} (SCO: {scoid})")
             try:
                 WeLearnPlayer.navigate_to_sco(
@@ -796,8 +842,7 @@ class WeLearnBot:
                 self._ui_log(f"   阶段1作答异常 ({scoid}): {e}")
                 continue
 
-            spent = time.time() - t0
-            rem = max(0.0, alloc_dwell - spent)
+            rem = max(0.0, alloc_dwell - phase1_wait)
             if rem > 0.3:
                 remaining_dwells.append((idx, tab, rem))
             else:
@@ -808,7 +853,7 @@ class WeLearnBot:
 
         num_workers = min(max_tabs, len(remaining_dwells))
         avg_rem = sum(r for _, _, r in remaining_dwells) / max(1, len(remaining_dwells))
-        ramp_delay = min(10.0, max(0.2, avg_rem * 0.15))
+        ramp_delay = min(1.5, max(0.2, avg_rem * 0.05))
 
         self._ui_log(
             f"\n--- [解耦模式 阶段 2/2] 启动 {num_workers} 个后台标签页并发纯挂时长 "
@@ -819,6 +864,7 @@ class WeLearnBot:
         active_slots: Dict[str, Dict[str, Any]] = {}
         queue_idx = 0
         last_launch_ts = 0.0
+        rr_cursor = 0
 
         try:
             while (queue_idx < len(remaining_dwells) or active_slots) and not self._should_stop():
@@ -830,7 +876,16 @@ class WeLearnBot:
                     and queue_idx < len(remaining_dwells)
                     and (last_launch_ts == 0.0 or (now - last_launch_ts) >= ramp_delay)
                 ):
-                    handle = free_handles[0]
+                    handle = None
+                    for offset in range(len(worker_handles)):
+                        cand = worker_handles[(rr_cursor + offset) % len(worker_handles)]
+                        if cand not in active_slots:
+                            handle = cand
+                            rr_cursor = (rr_cursor + offset + 1) % len(worker_handles)
+                            break
+                    if handle is None:
+                        handle = free_handles[0]
+
                     orig_idx, tab, rem_sec = remaining_dwells[queue_idx]
                     queue_idx += 1
                     scoid = tab.get("scoid", "")
@@ -850,6 +905,7 @@ class WeLearnBot:
                             self.driver, cid, classid, scoid, direct_url=direct_url
                         )
                         WeLearnPlayer.keep_tab_alive(self.driver)
+                        now_after = time.time()
                         active_slots[handle] = {
                             "orig_idx": orig_idx,
                             "tab": tab,
@@ -857,13 +913,28 @@ class WeLearnBot:
                             "disp_name": disp_name,
                             "tab_no": tab_no,
                             "rem_sec": rem_sec,
-                            "ready_at": time.time() + rem_sec,
+                            "ready_at": now_after + rem_sec,
+                            "last_ping": now_after,
                         }
-                        last_launch_ts = time.time()
+                        last_launch_ts = now_after
+                        if queue_idx < num_workers and len(active_slots) < num_workers:
+                            time.sleep(ramp_delay)
+                            continue
                     except Exception as e:
                         self._ui_log(f"   [Tab {tab_no}] 挂机载入异常 ({scoid}): {e}")
                         self._mark_tab_done(tab, on_task_done)
                         continue
+
+                # Periodically ping long-dwelling tabs
+                now = time.time()
+                for h, slot in list(active_slots.items()):
+                    if now - slot.get("last_ping", now) >= 25.0 and slot["ready_at"] - now > 3.0:
+                        try:
+                            self.driver.switch_to.window(h)
+                            WeLearnPlayer.keep_tab_alive(self.driver)
+                        except Exception:
+                            pass
+                        slot["last_ping"] = time.time()
 
                 # Check any slot whose dwell timer has completed
                 finished_handles = [

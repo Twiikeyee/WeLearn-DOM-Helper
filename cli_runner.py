@@ -83,7 +83,13 @@ class WeLearnCLI:
                 except Exception:
                     pass
             try:
-                shutil.copytree(self.profile_dir, active_dir)
+                shutil.copytree(
+                    self.profile_dir,
+                    active_dir,
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns("Singleton*", "Running*", "*Lock*"),
+                    ignore_dangling_symlinks=True,
+                )
             except Exception as e:
                 print(f"复制 Profile 失败，直接挂载: {e}")
                 active_dir = self.profile_dir
