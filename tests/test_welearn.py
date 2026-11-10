@@ -5,6 +5,7 @@ Unit tests for WeLearn-DOM-Helper components.
 
 import json
 import os
+import queue
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -13,8 +14,10 @@ from ai_client import OpenAICompatibleClient
 from question_solver import WeLearnQuestionSolver
 from webdriver_helper import WebDriverHelper
 from welearn_api import WeLearnAPI, WeLearnCourse, WeLearnSCO, WeLearnUnit
+from welearn_bot import DurationPlanner, WeLearnBot
 from welearn_config import Config
 from welearn_player import WeLearnFrameContext, WeLearnPlayer
+import config_editor
 
 
 class TestConfig(unittest.TestCase):
@@ -75,6 +78,13 @@ class TestWeLearnAPI(unittest.TestCase):
         self.assertEqual(course.cid, "4395")
         self.assertEqual(course.name, "英语综合教程 1")
         self.assertEqual(course.progress, "25%")
+
+    def test_normalize_cdn_addr(self):
+        raw = "//centercourseware.sflep.com/Course/unit_01/main8.html?m-1-1-8|B1U1 > Task 3"
+        self.assertEqual(
+            WeLearnAPI.normalize_cdn_addr(raw),
+            "https://centercourseware.sflep.com/Course/unit_01/main8.html?m-1-1-8",
+        )
 
 
 class TestWeLearnPlayer(unittest.TestCase):
@@ -180,6 +190,164 @@ class TestQuestionSolver(unittest.TestCase):
             self.assertEqual(count, 1)
             self.mock_ai.solve_subjective_question.assert_called()
             mock_fast.assert_called_with(mock_driver, mock_textarea, "Generated subjective answer")
+
+
+class TestConfigEditor(unittest.TestCase):
+    def test_default_config_types(self):
+        d = config_editor.DEFAULT_CONFIG
+        self.assertIsInstance(d["enable_llm_subjective"], bool)
+        self.assertFalse(d["enable_llm_subjective"])
+        self.assertIsInstance(d["headless"], bool)
+        self.assertIsInstance(d["debug_mode"], bool)
+        self.assertIsInstance(d["min_dwell_seconds"], int)
+        self.assertEqual(d["concurrency_mode"], "serial")
+        self.assertEqual(d["target_total_seconds"], 0)
+        self.assertEqual(d["max_concurrent_tabs"], 3)
+
+
+class TestDurationPlanner(unittest.TestCase):
+    def test_parse_learntime(self):
+        self.assertEqual(DurationPlanner.parse_learntime_seconds("00:05:12"), 312)
+        self.assertEqual(DurationPlanner.parse_learntime_seconds("01:00:00"), 3600)
+        self.assertEqual(DurationPlanner.parse_learntime_seconds("03:20"), 200)
+        self.assertEqual(DurationPlanner.parse_learntime_seconds("45"), 45)
+        self.assertEqual(DurationPlanner.parse_learntime_seconds(""), 0)
+
+    def test_plan_dwell_allocations_deducts_learned_and_matches_sum(self):
+        tabs = [
+            {"scoid": "m-1-1-1", "learntime": "00:01:00"},  # 60s
+            {"scoid": "m-1-1-2", "learntime": "00:00:40"},  # 40s
+            {"scoid": "m-1-1-3", "learntime": "00:00:00"},  # 0s
+            {"scoid": "m-1-1-4", "learntime": "00:00:20"},  # 20s
+        ]
+        # Already learned = 120s. Target = 300s -> Net needed = 180s
+        allocs, summary = DurationPlanner.plan_dwell_allocations(
+            selected_tabs=tabs, target_total_seconds=300, min_dwell_seconds=0
+        )
+        self.assertEqual(len(allocs), 4)
+        self.assertEqual(summary["already_learned_seconds"], 120)
+        self.assertEqual(summary["net_needed_seconds"], 180)
+        self.assertEqual(sum(allocs), 180)
+        self.assertTrue(all(a > 0 for a in allocs))
+
+    def test_plan_dwell_allocations_already_satisfied(self):
+        tabs = [
+            {"scoid": "m-1-1-1", "learntime": "00:10:00"},
+            {"scoid": "m-1-1-2", "learntime": "00:10:00"},
+        ]
+        allocs, summary = DurationPlanner.plan_dwell_allocations(
+            selected_tabs=tabs, target_total_seconds=600, min_dwell_seconds=0
+        )
+        self.assertEqual(summary["net_needed_seconds"], 0)
+        self.assertEqual(allocs, [0, 0])
+
+
+class TestConcurrencyModes(unittest.TestCase):
+    def _make_mock_driver(self):
+        driver = MagicMock()
+        driver.current_window_handle = "tab_1"
+        handles = ["tab_1"]
+
+        def open_new_tab(kind="tab"):
+            new_h = f"tab_{len(handles) + 1}"
+            handles.append(new_h)
+            driver.current_window_handle = new_h
+
+        def switch_win(h):
+            driver.current_window_handle = h
+
+        def close_win():
+            if driver.current_window_handle in handles and len(handles) > 1:
+                handles.remove(driver.current_window_handle)
+                driver.current_window_handle = handles[0]
+
+        driver.switch_to.new_window.side_effect = open_new_tab
+        driver.switch_to.window.side_effect = switch_win
+        driver.close.side_effect = close_win
+        type(driver).window_handles = property(lambda self_d: list(handles))
+        return driver
+
+    def test_pipeline_mode_preserves_submission_order(self):
+        cfg = Config(
+            concurrency_mode="pipeline",
+            target_total_seconds=2,
+            max_concurrent_tabs=3,
+            min_dwell_seconds=0,
+        )
+        log_q = queue.Queue()
+        bot = WeLearnBot(cfg, log_q)
+        bot.driver = self._make_mock_driver()
+
+        submitted_order = []
+        filled_order = []
+
+        def fake_fill(drv, scoid):
+            filled_order.append(scoid)
+            return {
+                "scoid": scoid,
+                "choice_count": 1,
+                "filling_count": 0,
+                "subjective_count": 0,
+                "record_count": 0,
+                "elapsed_solving": 0.05,
+                "is_voice_only": False,
+            }
+
+        def fake_submit(drv, scoid):
+            submitted_order.append(scoid)
+            return True
+
+        bot.solver.fill_sco_questions = MagicMock(side_effect=fake_fill)
+        bot.solver.submit_sco = MagicMock(side_effect=fake_submit)
+
+        tabs = [
+            {"scoid": "m-1-1-1", "l1_title": "Sec 1", "learntime": "00:00:00", "status": "not_started"},
+            {"scoid": "m-1-1-2", "l1_title": "Sec 2", "learntime": "00:00:00", "status": "not_started"},
+            {"scoid": "m-1-1-3", "l1_title": "Sec 3", "learntime": "00:00:00", "status": "not_started"},
+        ]
+
+        with patch.object(WeLearnPlayer, "navigate_to_sco", return_value=True), patch.object(
+            WeLearnFrameContext, "enter", return_value=True
+        ):
+            bot.process_selected_tabs(tabs)
+
+        # Must launch and submit strictly in 1 -> 2 -> 3 order
+        self.assertEqual(filled_order, ["m-1-1-1", "m-1-1-2", "m-1-1-3"])
+        self.assertEqual(submitted_order, ["m-1-1-1", "m-1-1-2", "m-1-1-3"])
+        self.assertTrue(all(t["status"] == "done" for t in tabs))
+
+    def test_decoupled_mode_single_submit_and_concurrent_dwell(self):
+        cfg = Config(
+            concurrency_mode="decoupled",
+            target_total_seconds=2,
+            max_concurrent_tabs=2,
+            min_dwell_seconds=0,
+        )
+        log_q = queue.Queue()
+        bot = WeLearnBot(cfg, log_q)
+        bot.driver = self._make_mock_driver()
+
+        solve_calls = []
+
+        def fake_solve(drv, scoid, dwell_seconds=None, skip_submit=False):
+            solve_calls.append(scoid)
+            return True
+
+        bot.solver.solve_sco = MagicMock(side_effect=fake_solve)
+
+        tabs = [
+            {"scoid": "m-1-1-1", "l1_title": "Sec 1", "learntime": "00:00:00", "status": "not_started"},
+            {"scoid": "m-1-1-2", "l1_title": "Sec 2", "learntime": "00:00:00", "status": "done"},
+        ]
+
+        with patch.object(WeLearnPlayer, "navigate_to_sco", return_value=True), patch.object(
+            WeLearnFrameContext, "enter", return_value=True
+        ):
+            bot.process_selected_tabs(tabs)
+
+        # Only undone task m-1-1-1 is solved in Phase 1; done task m-1-1-2 only dwells in Phase 2
+        self.assertEqual(solve_calls, ["m-1-1-1"])
+        self.assertTrue(all(t["status"] == "done" for t in tabs))
 
 
 if __name__ == "__main__":

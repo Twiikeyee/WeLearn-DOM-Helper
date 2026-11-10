@@ -68,10 +68,78 @@ class WeLearnPlayer:
         return None
 
     @classmethod
-    def navigate_to_sco(cls, driver, cid: str, classid: str, scoid: str) -> bool:
-        """Navigate to or switch active SCO."""
+    def is_direct_courseware_page(cls, driver) -> bool:
+        """Check if current top-level page is already a direct courseware/static CDN DOM."""
+        try:
+            url = (driver.current_url or "").lower()
+            if "centercourseware.sflep.com" in url:
+                return True
+            els = driver.find_elements(
+                By.CSS_SELECTOR,
+                'li[data-scoid], [data-controltype="choice"], [data-controltype="filling"], [data-controltype="submit"]',
+            )
+            return len(els) > 0
+        except Exception:
+            return False
+
+    @classmethod
+    def activate_direct_sco_page(cls, driver, scoid: str) -> None:
+        """Activate a specific li[data-scoid] when running directly on a static CDN courseware page."""
+        if not scoid:
+            return
+        try:
+            driver.execute_script(
+                """
+                var targetSco = arguments[0];
+                if (typeof window.SelectSamePageSCO === 'function') {
+                    try { window.SelectSamePageSCO(targetSco); } catch(e) {}
+                }
+                var allPages = document.querySelectorAll('li[data-scoid][data-controltype="page"], li[data-scoid]');
+                if (allPages.length > 0) {
+                    for (var i = 0; i < allPages.length; i++) {
+                        var el = allPages[i];
+                        if (el.getAttribute('data-scoid') === targetSco) {
+                            el.style.display = 'block';
+                            el.setAttribute(' data-active', 'true');
+                        } else if (el.getAttribute('data-controltype') === 'page') {
+                            el.style.display = 'none';
+                        }
+                    }
+                }
+                window.cur_scoid = targetSco;
+                """,
+                scoid,
+            )
+        except Exception:
+            pass
+
+    @classmethod
+    def navigate_to_sco(
+        cls,
+        driver,
+        cid: str,
+        classid: str,
+        scoid: str,
+        direct_url: Optional[str] = None,
+    ) -> bool:
+        """Navigate to or switch active SCO (supports both StudyCourse shell and static CDN direct URL)."""
         logger.info("Switching to SCO: %s", scoid)
-        
+
+        # Static CDN or direct courseware URL mode
+        if direct_url:
+            curr_url = (driver.current_url or "").split("#")[0]
+            target_base = direct_url.split("#")[0]
+            if curr_url != target_base:
+                driver.get(direct_url)
+                time.sleep(0.8)
+            cls.activate_direct_sco_page(driver, scoid)
+            return True
+
+        # If already on a direct courseware page (e.g. static CDN test page)
+        if not cls.is_shell_page(driver) and cls.is_direct_courseware_page(driver):
+            cls.activate_direct_sco_page(driver, scoid)
+            return True
+
         # If already on the StudyCourse shell for this cid/classid, try JS switch first
         if cls.is_shell_page(driver):
             curr_url = driver.current_url or ""
@@ -104,7 +172,10 @@ class WeLearnPlayer:
                     driver.switch_to.default_content()
                     side_li = driver.find_elements(By.CSS_SELECTOR, f"#liSCO_{scoid}, [data-scoid='{scoid}']")
                     if side_li:
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", side_li[0])
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();",
+                            side_li[0],
+                        )
                         time.sleep(1.5)
                         return True
                 except Exception:
@@ -114,7 +185,44 @@ class WeLearnPlayer:
         target_url = f"https://welearn.sflep.com/student/StudyCourse.aspx?cid={cid}&classid={classid}&sco={scoid}"
         driver.get(target_url)
         time.sleep(2.0)
+        try:
+            driver.execute_script(
+                "if (typeof window.SelectSCO === 'function') { window.SelectSCO(arguments[0]); }",
+                scoid,
+            )
+        except Exception:
+            pass
         return True
+
+    @classmethod
+    def keep_tab_alive(cls, driver) -> None:
+        """Spoof visibility state and keep timer active in background tabs."""
+        try:
+            driver.execute_script(
+                """
+                try {
+                    Object.defineProperty(document, 'hidden', {value: false, configurable: true});
+                    Object.defineProperty(document, 'visibilityState', {value: 'visible', configurable: true});
+                } catch(e) {}
+                """
+            )
+        except Exception:
+            pass
+
+    @classmethod
+    def flush_shell_sco(cls, driver) -> None:
+        """Trigger native shell EndSCO(false) to persist session time without closing."""
+        try:
+            driver.switch_to.default_content()
+            driver.execute_script(
+                """
+                if (typeof window.EndSCO === 'function') {
+                    try { window.EndSCO(false); } catch(e) {}
+                }
+                """
+            )
+        except Exception:
+            pass
 
 
 class WeLearnFrameContext:
@@ -143,6 +251,9 @@ class WeLearnFrameContext:
                 frame_el = WeLearnPlayer.find_content_frame(self.driver)
                 if frame_el:
                     self.driver.switch_to.frame(frame_el)
+                    self.entered = True
+                    return True
+                if WeLearnPlayer.is_direct_courseware_page(self.driver):
                     self.entered = True
                     return True
             except Exception:

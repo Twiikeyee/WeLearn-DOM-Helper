@@ -10,12 +10,13 @@ Licensed under GNU AGPLv3.
 import logging
 import os
 import queue
+import random
 import re
 import sys
 import tempfile
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -40,6 +41,134 @@ from welearn_config import Config
 from welearn_player import WeLearnFrameContext, WeLearnPlayer
 
 logger = logging.getLogger("WeLearnBot")
+
+
+class DurationPlanner:
+    """Smart study duration budgeting: deducts existing learned time and distributes net target time randomly."""
+
+    @staticmethod
+    def parse_learntime_seconds(learntime_str: Any) -> int:
+        """Parse 'HH:MM:SS', 'MM:SS', or numeric seconds string into integer seconds."""
+        if learntime_str is None:
+            return 0
+        if isinstance(learntime_str, (int, float)):
+            return max(0, int(learntime_str))
+
+        raw = str(learntime_str).strip()
+        if not raw:
+            return 0
+
+        if ":" in raw:
+            parts = raw.split(":")
+            try:
+                if len(parts) == 3:
+                    return max(0, int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2])))
+                elif len(parts) == 2:
+                    return max(0, int(parts[0]) * 60 + int(float(parts[1])))
+            except Exception:
+                return 0
+
+        try:
+            return max(0, int(float(raw)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def format_seconds(seconds: int) -> str:
+        """Format integer seconds into HH:MM:SS."""
+        sec = max(0, int(seconds))
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    @classmethod
+    def plan_dwell_allocations(
+        cls,
+        selected_tabs: List[Dict],
+        target_total_seconds: int,
+        min_dwell_seconds: int = 0,
+        all_course_tabs: Optional[List[Dict]] = None,
+    ) -> Tuple[List[int], Dict[str, int]]:
+        """
+        Calculate per-SCO dwell seconds for selected_tabs.
+
+        - If target_total_seconds <= 0: each task gets min_dwell_seconds.
+        - If target_total_seconds > 0:
+          1. Sum existing learntime across all_course_tabs (or selected_tabs if not given).
+          2. Net deficit = max(0, target_total_seconds - already_learned_seconds).
+          3. Randomly distribute net deficit across selected_tabs using weighted jitter (±35%)
+             while ensuring exact sum == net deficit and respecting min_dwell_seconds.
+        """
+        n = len(selected_tabs)
+        min_floor = max(0, int(min_dwell_seconds or 0))
+        target_total = max(0, int(target_total_seconds or 0))
+
+        reference_tabs = all_course_tabs if all_course_tabs else selected_tabs
+        already_learned = sum(cls.parse_learntime_seconds(t.get("learntime", "00:00:00")) for t in reference_tabs)
+
+        if n == 0:
+            return [], {
+                "target_total_seconds": target_total,
+                "already_learned_seconds": already_learned,
+                "net_needed_seconds": 0,
+                "planned_total_seconds": 0,
+            }
+
+        if target_total <= 0:
+            allocs = [min_floor for _ in range(n)]
+            return allocs, {
+                "target_total_seconds": 0,
+                "already_learned_seconds": already_learned,
+                "net_needed_seconds": sum(allocs),
+                "planned_total_seconds": sum(allocs),
+            }
+
+        net_needed = max(0, target_total - already_learned)
+        if net_needed == 0:
+            allocs = [min_floor for _ in range(n)]
+            return allocs, {
+                "target_total_seconds": target_total,
+                "already_learned_seconds": already_learned,
+                "net_needed_seconds": 0,
+                "planned_total_seconds": sum(allocs),
+            }
+
+        if n == 1:
+            val = max(min_floor, net_needed)
+            return [val], {
+                "target_total_seconds": target_total,
+                "already_learned_seconds": already_learned,
+                "net_needed_seconds": net_needed,
+                "planned_total_seconds": val,
+            }
+
+        # Generate non-uniform random weights with slight preference for sections with less learned time
+        weights = []
+        for t in selected_tabs:
+            learned_i = cls.parse_learntime_seconds(t.get("learntime", "00:00:00"))
+            scarcity_factor = 1.0 / (1.0 + (learned_i / 600.0))
+            jitter = random.uniform(0.65, 1.35)
+            weights.append(max(0.1, scarcity_factor * jitter))
+
+        weight_sum = sum(weights)
+        raw_shares = [(w / weight_sum) * net_needed for w in weights]
+        int_shares = [int(s) for s in raw_shares]
+        remainder = net_needed - sum(int_shares)
+
+        # Distribute integer remainder to items with largest fractional part
+        frac_indices = sorted(range(n), key=lambda i: (raw_shares[i] - int_shares[i]), reverse=True)
+        for i in range(remainder):
+            int_shares[frac_indices[i % n]] += 1
+
+        # Apply per-task minimum floor if requested
+        final_allocs = [max(min_floor, s) for s in int_shares]
+        return final_allocs, {
+            "target_total_seconds": target_total,
+            "already_learned_seconds": already_learned,
+            "net_needed_seconds": net_needed,
+            "planned_total_seconds": sum(final_allocs),
+        }
 
 
 class WeLearnBot:
@@ -69,6 +198,17 @@ class WeLearnBot:
         self.active_classid: str = ""
         self.courses_cache: List[WeLearnCourse] = []
         self.units_cache: List[WeLearnUnit] = []
+        self.all_tasks_cache: List[Dict] = []
+
+    def reload_config(self, path: str = "config.json") -> Config:
+        """Reload runtime configuration from disk and sync with solver."""
+        try:
+            self.config = Config.from_json(path)
+            self.solver.config = self.config
+            self.ai_client.config = self.config
+        except Exception as e:
+            logger.debug("reload_config failed: %s", e)
+        return self.config
 
     def _ui_log(self, message: str) -> None:
         """Forward log message to GUI log queue."""
@@ -119,6 +259,9 @@ class WeLearnBot:
         options.add_argument("--disable-infobars")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
         if self.config.headless:
@@ -132,6 +275,9 @@ class WeLearnBot:
         options.add_argument("--disable-infobars")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
         if self.config.headless:
@@ -286,64 +432,462 @@ class WeLearnBot:
                 }
                 tasks.append(task_dict)
 
+        self.all_tasks_cache = tasks
         self._ui_log(f"目录扫描完成，共整理出 {len(tasks)} 个小节任务。")
         return tasks
+
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """Sleep in small increments; return True if interrupted by stop request."""
+        end_ts = time.time() + max(0.0, float(seconds))
+        while time.time() < end_ts:
+            if self._should_stop():
+                return True
+            time.sleep(min(0.2, max(0.01, end_ts - time.time())))
+        return self._should_stop()
+
+    def _mark_tab_done(
+        self, tab: Dict, on_task_done: Optional[Callable[[Dict], None]] = None
+    ) -> None:
+        tab["status"] = "done"
+        tab["status_text"] = "已完成"
+        if on_task_done:
+            try:
+                on_task_done(tab)
+            except Exception as e:
+                logger.debug("on_task_done callback error: %s", e)
+
+    def _acquire_worker_tabs(self, count: int) -> Tuple[str, List[str]]:
+        """Ensure `count` browser tab handles are open; returns (primary_handle, all_worker_handles)."""
+        base_handle = self.driver.current_window_handle
+        worker_handles = [base_handle]
+        needed = max(0, count - 1)
+        for _ in range(needed):
+            try:
+                self.driver.switch_to.new_window("tab")
+                worker_handles.append(self.driver.current_window_handle)
+            except Exception:
+                try:
+                    before = set(self.driver.window_handles)
+                    self.driver.execute_script("window.open('about:blank', '_blank');")
+                    after = [h for h in self.driver.window_handles if h not in before]
+                    if after:
+                        self.driver.switch_to.window(after[0])
+                        worker_handles.append(after[0])
+                except Exception as e:
+                    logger.debug("Failed to open extra worker tab: %s", e)
+                    break
+        try:
+            self.driver.switch_to.window(base_handle)
+        except Exception:
+            pass
+        return base_handle, worker_handles
+
+    def _cleanup_worker_tabs(self, base_handle: str, worker_handles: List[str]) -> None:
+        """Close extra worker tabs created for concurrency and restore primary tab."""
+        for h in worker_handles:
+            if h != base_handle:
+                try:
+                    self.driver.switch_to.window(h)
+                    self.driver.close()
+                except Exception:
+                    pass
+        try:
+            self.driver.switch_to.window(base_handle)
+        except Exception:
+            pass
 
     def process_selected_tabs(
         self, selected_tabs: List[Dict], on_task_done: Optional[Callable[[Dict], None]] = None
     ) -> None:
-        """Batch process user-selected SCO tasks."""
+        """Batch process user-selected SCO tasks using configured concurrency mode and duration budget."""
         if not self.driver:
             self._ui_log("错误: 浏览器尚未启动！")
             return
 
+        if not selected_tabs:
+            self._ui_log("未选中任何任务。")
+            return
+
         self.clear_stop()
+        mode = (getattr(self.config, "concurrency_mode", "serial") or "serial").strip().lower()
+        target_total = int(getattr(self.config, "target_total_seconds", 0) or 0)
+        min_dwell = int(getattr(self.config, "min_dwell_seconds", 0) or 0)
+        max_tabs = max(1, int(getattr(self.config, "max_concurrent_tabs", 3) or 3))
+
+        allocations, summary = DurationPlanner.plan_dwell_allocations(
+            selected_tabs=selected_tabs,
+            target_total_seconds=target_total,
+            min_dwell_seconds=min_dwell,
+            all_course_tabs=self.all_tasks_cache if self.all_tasks_cache else None,
+        )
+
+        mode_names = {
+            "serial": "串联顺序模式 (Serial)",
+            "decoupled": f"答题/挂机解耦并发模式 (Decoupled, 最大 {max_tabs} 标签页)",
+            "pipeline": f"错峰流水线并发模式 (Pipeline, 最大 {max_tabs} 标签页)",
+        }
         self._ui_log(f"====== 开始批量处理 {len(selected_tabs)} 个选中任务 ======")
+        self._ui_log(f"运行模式: {mode_names.get(mode, mode)}")
 
-        for idx, tab in enumerate(selected_tabs):
-            if self._should_stop():
-                self._ui_log("收到停止请求，批量处理已中断。")
-                break
+        if target_total > 0:
+            self._ui_log(
+                f"时长预算: 目标总时长 {target_total}s ({DurationPlanner.format_seconds(target_total)}) | "
+                f"已学时长 {summary['already_learned_seconds']}s | "
+                f"需净增时长 {summary['net_needed_seconds']}s | "
+                f"单小节分摊范围 {min(allocations)}s ~ {max(allocations)}s"
+            )
+        elif min_dwell > 0:
+            self._ui_log(f"时长策略: 按单小节保底停留 {min_dwell}s 执行")
+        else:
+            self._ui_log("时长策略: 极速模式 (0s 额外等待)")
 
-            scoid = tab.get("scoid", "")
-            cid = tab.get("cid") or self.active_cid
-            classid = tab.get("classid") or self.active_classid
-            disp_name = tab.get("l1_title") or scoid
-
-            self._ui_log(f"\n[{idx + 1}/{len(selected_tabs)}] 正在处理: {disp_name} (SCO: {scoid})")
-
-            try:
-                # 1. Switch to the target SCO
-                WeLearnPlayer.navigate_to_sco(self.driver, cid, classid, scoid)
-
-                # 2. Enter content frame and solve
-                with WeLearnFrameContext(self.driver, timeout=12.0) as ctx:
-                    if not ctx.entered:
-                        self._ui_log(f"   警告: 无法切入 contentFrame，跳过该小节: {scoid}")
-                        continue
-
-                    # Solve questions inside iframe
-                    self.solver.solve_sco(self.driver, scoid)
-
-                tab["status"] = "done"
-                tab["status_text"] = "已完成"
-                if on_task_done:
-                    try:
-                        on_task_done(tab)
-                    except Exception as e:
-                        logger.debug("on_task_done callback error: %s", e)
-
-            except Exception as e:
-                self._ui_log(f"   处理异常: {e}")
-                logger.error("Error processing tab %s: %s", scoid, e, exc_info=True)
-
-            time.sleep(1.0)
+        if mode == "pipeline" and len(selected_tabs) > 1 and max_tabs > 1:
+            self._process_tabs_pipeline(selected_tabs, allocations, max_tabs, on_task_done)
+        elif mode == "decoupled" and len(selected_tabs) > 1 and max_tabs > 1:
+            self._process_tabs_decoupled(selected_tabs, allocations, max_tabs, on_task_done)
+        else:
+            self._process_tabs_serial(selected_tabs, allocations, on_task_done)
 
         self._ui_log(
             "\n====== 批量处理结束 ======"
             if not self._should_stop()
             else "\n====== 批量处理已停止 ======"
         )
+
+    def _process_tabs_serial(
+        self,
+        selected_tabs: List[Dict],
+        allocations: List[int],
+        on_task_done: Optional[Callable[[Dict], None]] = None,
+    ) -> None:
+        """Serial mode: single tab processes each SCO sequentially."""
+        for idx, tab in enumerate(selected_tabs):
+            if self._should_stop():
+                self._ui_log("收到停止请求，串联处理已中断。")
+                break
+
+            scoid = tab.get("scoid", "")
+            cid = tab.get("cid") or self.active_cid
+            classid = tab.get("classid") or self.active_classid
+            direct_url = tab.get("direct_url")
+            disp_name = tab.get("l1_title") or scoid
+            dwell_sec = allocations[idx] if idx < len(allocations) else self.config.min_dwell_seconds
+
+            self._ui_log(
+                f"\n[{idx + 1}/{len(selected_tabs)}] [串联] 正在处理: {disp_name} "
+                f"(SCO: {scoid}, 分配时长: {dwell_sec}s)"
+            )
+
+            try:
+                WeLearnPlayer.navigate_to_sco(
+                    self.driver, cid, classid, scoid, direct_url=direct_url
+                )
+
+                with WeLearnFrameContext(self.driver, timeout=12.0) as ctx:
+                    if not ctx.entered:
+                        self._ui_log(f"   警告: 无法切入课件上下文，跳过该小节: {scoid}")
+                        continue
+
+                    self.solver.solve_sco(self.driver, scoid, dwell_seconds=dwell_sec)
+
+                WeLearnPlayer.flush_shell_sco(self.driver)
+                self._mark_tab_done(tab, on_task_done)
+
+            except Exception as e:
+                self._ui_log(f"   处理异常: {e}")
+                logger.error("Error processing tab %s: %s", scoid, e, exc_info=True)
+
+            if self._sleep_interruptible(0.8):
+                break
+
+    def _process_tabs_pipeline(
+        self,
+        selected_tabs: List[Dict],
+        allocations: List[int],
+        max_tabs: int,
+        on_task_done: Optional[Callable[[Dict], None]] = None,
+    ) -> None:
+        """
+        Staggered Pipeline Mode:
+        - Opens up to `max_tabs` browser tabs in parallel.
+        - Staggers task launch times and fills DOM answers immediately upon load.
+        - Uses an Ordered Submission Gate so tasks submit strictly in catalog order (0 -> 1 -> 2...)
+          with an adaptive minimum time gap between consecutive submissions.
+        """
+        num_workers = min(max_tabs, len(selected_tabs))
+        avg_dwell = sum(allocations) / max(1, len(allocations))
+        # Adaptive stagger so short tests finish quickly while long sessions space out naturally
+        base_ramp_delay = min(15.0, max(0.25, avg_dwell * 0.18))
+        base_submit_gap = min(45.0, max(0.35, avg_dwell * 0.22))
+
+        base_handle, worker_handles = self._acquire_worker_tabs(num_workers)
+        self._ui_log(
+            f"[流水线并发] 已就绪 {len(worker_handles)} 个并发标签页 "
+            f"(错峰发车间隔 ~{base_ramp_delay:.1f}s, 保序提交最小间隔 ~{base_submit_gap:.1f}s)"
+        )
+
+        # active_slots maps window_handle -> slot metadata dict
+        active_slots: Dict[str, Dict[str, Any]] = {}
+        skipped_seqs = set()
+        next_launch_idx = 0
+        next_submit_seq = 0
+        last_launch_ts = 0.0
+        last_submit_ts = 0.0
+        total_tasks = len(selected_tabs)
+
+        try:
+            while (next_launch_idx < total_tasks or active_slots) and not self._should_stop():
+                now = time.time()
+
+                # 1. Advance next_submit_seq if any sequence index was skipped
+                while next_submit_seq in skipped_seqs:
+                    next_submit_seq += 1
+
+                # 2. Launch next task into an idle tab if ramp-up stagger allows
+                free_handles = [h for h in worker_handles if h not in active_slots]
+                if (
+                    free_handles
+                    and next_launch_idx < total_tasks
+                    and (last_launch_ts == 0.0 or (now - last_launch_ts) >= base_ramp_delay)
+                ):
+                    handle = free_handles[0]
+                    seq_idx = next_launch_idx
+                    next_launch_idx += 1
+                    tab = selected_tabs[seq_idx]
+                    scoid = tab.get("scoid", "")
+                    cid = tab.get("cid") or self.active_cid
+                    classid = tab.get("classid") or self.active_classid
+                    direct_url = tab.get("direct_url")
+                    disp_name = tab.get("l1_title") or scoid
+                    alloc_dwell = float(allocations[seq_idx] if seq_idx < len(allocations) else 0)
+
+                    tab_no = worker_handles.index(handle) + 1
+                    self._ui_log(
+                        f"\n[流水线发车 #{seq_idx + 1}/{total_tasks} -> Tab {tab_no}] "
+                        f"载入并作答: {disp_name} (SCO: {scoid}, 目标停留: {alloc_dwell:.1f}s)"
+                    )
+
+                    try:
+                        self.driver.switch_to.window(handle)
+                        WeLearnPlayer.navigate_to_sco(
+                            self.driver, cid, classid, scoid, direct_url=direct_url
+                        )
+                        WeLearnPlayer.keep_tab_alive(self.driver)
+
+                        with WeLearnFrameContext(self.driver, timeout=12.0) as ctx:
+                            if not ctx.entered:
+                                self._ui_log(f"   警告: [Tab {tab_no}] 无法切入课件上下文，跳过: {scoid}")
+                                skipped_seqs.add(seq_idx)
+                                continue
+
+                            stats = self.solver.fill_sco_questions(self.driver, scoid)
+                            elapsed = stats.get("elapsed_solving", 0.0)
+
+                        rem_wait = max(0.0, alloc_dwell - elapsed)
+                        active_slots[handle] = {
+                            "seq_idx": seq_idx,
+                            "tab": tab,
+                            "scoid": scoid,
+                            "disp_name": disp_name,
+                            "tab_no": tab_no,
+                            "alloc_dwell": alloc_dwell,
+                            "ready_at": time.time() + rem_wait,
+                        }
+                        last_launch_ts = time.time()
+                    except Exception as e:
+                        self._ui_log(f"   [Tab {tab_no}] 发车异常 ({scoid}): {e}")
+                        logger.error("Pipeline launch error on %s: %s", scoid, e, exc_info=True)
+                        skipped_seqs.add(seq_idx)
+                        continue
+
+                # 3. Ordered Submission Gate: check if the slot with `next_submit_seq` is ready to submit
+                target_handle = None
+                for h, slot in active_slots.items():
+                    if slot["seq_idx"] == next_submit_seq:
+                        target_handle = h
+                        break
+
+                if target_handle is not None:
+                    slot = active_slots[target_handle]
+                    now = time.time()
+                    submit_gap_ok = (last_submit_ts == 0.0) or ((now - last_submit_ts) >= base_submit_gap)
+                    if now >= slot["ready_at"] and submit_gap_ok:
+                        tab_no = slot["tab_no"]
+                        scoid = slot["scoid"]
+                        tab = slot["tab"]
+                        self._ui_log(
+                            f"[流水线保序提交 #{slot['seq_idx'] + 1}/{total_tasks} <- Tab {tab_no}] "
+                            f"挂机已满 ({slot['alloc_dwell']:.1f}s)，正在提交: {slot['disp_name']} ({scoid})"
+                        )
+                        try:
+                            self.driver.switch_to.window(target_handle)
+                            with WeLearnFrameContext(self.driver, timeout=8.0) as ctx:
+                                if ctx.entered:
+                                    self.solver.submit_sco(self.driver, scoid)
+                            WeLearnPlayer.flush_shell_sco(self.driver)
+                        except Exception as e:
+                            self._ui_log(f"   [Tab {tab_no}] 提交异常 ({scoid}): {e}")
+
+                        last_submit_ts = time.time()
+                        self._mark_tab_done(tab, on_task_done)
+                        del active_slots[target_handle]
+                        next_submit_seq += 1
+                        continue
+
+                time.sleep(0.15)
+        finally:
+            self._cleanup_worker_tabs(base_handle, worker_handles)
+
+    def _process_tabs_decoupled(
+        self,
+        selected_tabs: List[Dict],
+        allocations: List[int],
+        max_tabs: int,
+        on_task_done: Optional[Callable[[Dict], None]] = None,
+    ) -> None:
+        """
+        Decoupled Mode:
+        - Phase 1: Single primary tab answers and submits all undone SCOs strictly sequentially
+          with brief spacing so `submit_time` timeline is 100% single-threaded.
+        - Phase 2: Multi-tab worker pool concurrently opens SCOs that still need remaining dwell time
+          and keeps them alive until their allocated duration is met (without re-clicking submit).
+        """
+        total_tasks = len(selected_tabs)
+        remaining_dwells: List[Tuple[int, Dict, float]] = []
+
+        self._ui_log(f"\n--- [解耦模式 阶段 1/2] 单标签页顺序快速作答与提交 (共 {total_tasks} 个小节) ---")
+        for idx, tab in enumerate(selected_tabs):
+            if self._should_stop():
+                return
+
+            scoid = tab.get("scoid", "")
+            cid = tab.get("cid") or self.active_cid
+            classid = tab.get("classid") or self.active_classid
+            direct_url = tab.get("direct_url")
+            disp_name = tab.get("l1_title") or scoid
+            alloc_dwell = float(allocations[idx] if idx < len(allocations) else 0)
+            is_already_done = tab.get("status") == "done"
+
+            if is_already_done:
+                self._ui_log(
+                    f"[{idx + 1}/{total_tasks}] [已完成小节] {disp_name} ({scoid}) 跳过重做，转入阶段 2 补时长 ({alloc_dwell:.1f}s)"
+                )
+                if alloc_dwell > 0.2:
+                    remaining_dwells.append((idx, tab, alloc_dwell))
+                else:
+                    self._mark_tab_done(tab, on_task_done)
+                continue
+
+            # Brief dwell during Phase 1 so sequential submit timestamps are naturally spaced
+            phase1_wait = min(alloc_dwell, 1.5)
+            t0 = time.time()
+            self._ui_log(f"[{idx + 1}/{total_tasks}] [阶段1-顺序作答] {disp_name} (SCO: {scoid})")
+            try:
+                WeLearnPlayer.navigate_to_sco(
+                    self.driver, cid, classid, scoid, direct_url=direct_url
+                )
+                with WeLearnFrameContext(self.driver, timeout=12.0) as ctx:
+                    if not ctx.entered:
+                        self._ui_log(f"   警告: 无法切入课件上下文，跳过: {scoid}")
+                        continue
+                    self.solver.solve_sco(self.driver, scoid, dwell_seconds=phase1_wait)
+                WeLearnPlayer.flush_shell_sco(self.driver)
+            except Exception as e:
+                self._ui_log(f"   阶段1作答异常 ({scoid}): {e}")
+                continue
+
+            spent = time.time() - t0
+            rem = max(0.0, alloc_dwell - spent)
+            if rem > 0.3:
+                remaining_dwells.append((idx, tab, rem))
+            else:
+                self._mark_tab_done(tab, on_task_done)
+
+        if not remaining_dwells or self._should_stop():
+            return
+
+        num_workers = min(max_tabs, len(remaining_dwells))
+        avg_rem = sum(r for _, _, r in remaining_dwells) / max(1, len(remaining_dwells))
+        ramp_delay = min(10.0, max(0.2, avg_rem * 0.15))
+
+        self._ui_log(
+            f"\n--- [解耦模式 阶段 2/2] 启动 {num_workers} 个后台标签页并发纯挂时长 "
+            f"(共 {len(remaining_dwells)} 个小节待补齐时长，不重复点击提交) ---"
+        )
+
+        base_handle, worker_handles = self._acquire_worker_tabs(num_workers)
+        active_slots: Dict[str, Dict[str, Any]] = {}
+        queue_idx = 0
+        last_launch_ts = 0.0
+
+        try:
+            while (queue_idx < len(remaining_dwells) or active_slots) and not self._should_stop():
+                now = time.time()
+                free_handles = [h for h in worker_handles if h not in active_slots]
+
+                if (
+                    free_handles
+                    and queue_idx < len(remaining_dwells)
+                    and (last_launch_ts == 0.0 or (now - last_launch_ts) >= ramp_delay)
+                ):
+                    handle = free_handles[0]
+                    orig_idx, tab, rem_sec = remaining_dwells[queue_idx]
+                    queue_idx += 1
+                    scoid = tab.get("scoid", "")
+                    cid = tab.get("cid") or self.active_cid
+                    classid = tab.get("classid") or self.active_classid
+                    direct_url = tab.get("direct_url")
+                    disp_name = tab.get("l1_title") or scoid
+                    tab_no = worker_handles.index(handle) + 1
+
+                    self._ui_log(
+                        f"[阶段2-并发挂机 #{orig_idx + 1} -> Tab {tab_no}] "
+                        f"打开 {disp_name} ({scoid}) 纯挂机 {rem_sec:.1f}s..."
+                    )
+                    try:
+                        self.driver.switch_to.window(handle)
+                        WeLearnPlayer.navigate_to_sco(
+                            self.driver, cid, classid, scoid, direct_url=direct_url
+                        )
+                        WeLearnPlayer.keep_tab_alive(self.driver)
+                        active_slots[handle] = {
+                            "orig_idx": orig_idx,
+                            "tab": tab,
+                            "scoid": scoid,
+                            "disp_name": disp_name,
+                            "tab_no": tab_no,
+                            "rem_sec": rem_sec,
+                            "ready_at": time.time() + rem_sec,
+                        }
+                        last_launch_ts = time.time()
+                    except Exception as e:
+                        self._ui_log(f"   [Tab {tab_no}] 挂机载入异常 ({scoid}): {e}")
+                        self._mark_tab_done(tab, on_task_done)
+                        continue
+
+                # Check any slot whose dwell timer has completed
+                finished_handles = [
+                    h for h, slot in active_slots.items() if time.time() >= slot["ready_at"]
+                ]
+                for h in finished_handles:
+                    slot = active_slots.pop(h)
+                    tab = slot["tab"]
+                    scoid = slot["scoid"]
+                    tab_no = slot["tab_no"]
+                    try:
+                        self.driver.switch_to.window(h)
+                        WeLearnPlayer.flush_shell_sco(self.driver)
+                    except Exception:
+                        pass
+                    self._ui_log(
+                        f"[阶段2-挂机完成 #{slot['orig_idx'] + 1} <- Tab {tab_no}] "
+                        f"{slot['disp_name']} ({scoid}) 已补齐时长 ({slot['rem_sec']:.1f}s)"
+                    )
+                    self._mark_tab_done(tab, on_task_done)
+
+                time.sleep(0.15)
+        finally:
+            self._cleanup_worker_tabs(base_handle, worker_handles)
 
     def quick_process_current_page(self) -> None:
         """Solve whatever SCO is currently active in the browser."""

@@ -192,9 +192,7 @@ class FluentModernGUI(MSFluentWindow):
 
         # Left: Task Panel
         left_card = self._panel_card("任务目录树 (Unit -> Section -> SCO)")
-        left_layout = QVBoxLayout(left_card)
-        left_layout.setContentsMargins(14, 12, 14, 12)
-        left_layout.setSpacing(10)
+        left_layout = left_card.layout()
 
         # Toolbar
         toolbar = QHBoxLayout()
@@ -248,9 +246,7 @@ class FluentModernGUI(MSFluentWindow):
 
         # Right: Log Terminal
         right_card = self._panel_card("运行日志")
-        right_layout = QVBoxLayout(right_card)
-        right_layout.setContentsMargins(14, 12, 14, 12)
-        right_layout.setSpacing(8)
+        right_layout = right_card.layout()
 
         self.log_text = TextEdit()
         self.log_text.setReadOnly(True)
@@ -271,10 +267,11 @@ class FluentModernGUI(MSFluentWindow):
 
     def _panel_card(self, title: str):
         card = CardWidget()
-        header = QLabel(title)
-        header.setStyleSheet("color: #aab2c0; font-size: 13px; font-weight: 600; padding: 6px 12px 0 12px;")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(10)
+        header = QLabel(title)
+        header.setStyleSheet("color: #aab2c0; font-size: 13px; font-weight: 600; padding: 0 0 4px 0;")
         card_layout.addWidget(header)
         return card
 
@@ -335,9 +332,19 @@ class FluentModernGUI(MSFluentWindow):
 
     def _open_config_editor(self):
         try:
-            from config_editor import ConfigEditorDialog
-            dlg = ConfigEditorDialog(self)
-            dlg.exec_()
+            from config_editor import ConfigEditor
+
+            def _on_cfg_saved(new_data):
+                cfg = self.bot.reload_config()
+                self.gui_log_queue.put(
+                    f"[配置已热重载] 并发模式: {cfg.concurrency_mode} | "
+                    f"目标总时长: {cfg.target_total_seconds}s | "
+                    f"并发标签页上限: {cfg.max_concurrent_tabs} | "
+                    f"单节保底停留: {cfg.min_dwell_seconds}s"
+                )
+
+            self._config_editor = ConfigEditor(on_saved=_on_cfg_saved)
+            self._config_editor.show()
         except Exception as e:
             self.gui_log_queue.put(f"打开配置编辑器失败: {e}")
 
@@ -471,11 +478,16 @@ class FluentModernGUI(MSFluentWindow):
         badge.setStyleSheet("color: #ffb25f; background: rgba(255, 178, 95, 0.15); padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 600;")
         row_layout.addWidget(badge)
 
-        # Task Name
+        # Task Name & LearnTime
         title = tab.get("l1_title") or tab.get("scoid", "")
+        learntime = tab.get("learntime") or "00:00:00"
         title_lbl = QLabel(f"{title} ({tab.get('scoid', '')})")
         title_lbl.setStyleSheet("color: #d8dee9; font-size: 13px;")
         row_layout.addWidget(title_lbl, 1)
+
+        time_lbl = QLabel(f"⏱ {learntime}")
+        time_lbl.setStyleSheet("color: #7b8390; font-size: 11px; padding: 2px 6px;")
+        row_layout.addWidget(time_lbl)
 
         # Status Pill
         is_done = tab.get("status") == "done"
@@ -549,6 +561,7 @@ class FluentModernGUI(MSFluentWindow):
 
     def _run_auto_thread(self, selected_tabs: List[Dict]):
         try:
+            self.bot.reload_config()
             self.bot.process_selected_tabs(
                 selected_tabs,
                 on_task_done=lambda tab: self._bridge.invoke.emit(lambda t=tab: self._on_task_completed(t))

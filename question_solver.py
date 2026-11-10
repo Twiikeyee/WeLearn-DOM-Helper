@@ -44,13 +44,14 @@ class WeLearnQuestionSolver:
         self.log_callback = log_callback or (lambda msg: logger.info(msg))
 
     def log(self, message: str) -> None:
-        """Deliver log message to UI queue and logger."""
-        logger.info(message)
+        """Deliver log message to UI queue or logger."""
         if self.log_callback:
             try:
                 self.log_callback(message)
             except Exception:
                 pass
+        else:
+            logger.info(message)
 
     def _fill_text(self, driver, element, text: str) -> None:
         """Dispatch text input according to typing_mode (fast vs simulate)."""
@@ -94,39 +95,63 @@ class WeLearnQuestionSolver:
 
         return driver
 
-    def solve_sco(self, driver, scoid: str) -> bool:
-        """Process all questions within the active SCO scope and submit."""
+    def fill_sco_questions(self, driver, scoid: str) -> Dict[str, Any]:
+        """Fill all questions within the active SCO scope without waiting or submitting."""
         start_time = time.time()
         scope = self.locate_sco_scope(driver, scoid)
         self.log(f"-> 锁定小节作答范围: SCO [{scoid}]")
 
-        questions_answered = 0
-
         # Step 1: Solve Choice Questions (div[data-controltype="choice"])
         choice_count = self._solve_choices(driver, scope)
-        questions_answered += choice_count
 
         # Step 2: Solve Objective Short Fill-in (div[data-controltype="filling"])
         filling_count = self._solve_objective_fillings(driver, scope)
-        questions_answered += filling_count
 
         # Step 3: Solve Subjective Long Fill-in / Open Essay (div[data-controltype="fillinglong"])
         subjective_count = self._solve_subjective_fillings(driver, scope)
-        questions_answered += subjective_count
 
         # Step 4: Handle Audio / Record elements
         record_count = self._handle_audio_records(driver, scope)
-        questions_answered += record_count
 
-        total_found = choice_count + filling_count + subjective_count + record_count
         elapsed_solving = time.time() - start_time
+        is_voice_only = (record_count > 0) and (choice_count + filling_count + subjective_count == 0)
         self.log(
             f"   作答统计: 选择 {choice_count} 道, 填空 {filling_count} 道, "
-            f"主观题 {subjective_count} 道 (耗时 {elapsed_solving:.1f} 秒)"
+            f"主观题 {subjective_count} 道, 语音/录音 {record_count} 道 (耗时 {elapsed_solving:.1f} 秒)"
         )
+        if is_voice_only:
+            self.log(f"   提示: SCO [{scoid}] 为纯语音/口语录音题，若平台限制网页提交将仅累计学习时长。")
+
+        return {
+            "scoid": scoid,
+            "choice_count": choice_count,
+            "filling_count": filling_count,
+            "subjective_count": subjective_count,
+            "record_count": record_count,
+            "elapsed_solving": elapsed_solving,
+            "is_voice_only": is_voice_only,
+        }
+
+    def solve_sco(
+        self,
+        driver,
+        scoid: str,
+        dwell_seconds: Optional[float] = None,
+        skip_submit: bool = False,
+    ) -> bool:
+        """Process all questions within the active SCO scope, dwell, and optionally submit."""
+        stats = self.fill_sco_questions(driver, scoid)
+        elapsed_solving = stats["elapsed_solving"]
+        scope = self.locate_sco_scope(driver, scoid)
 
         # Step 5: Dynamic dwell time and submission
-        self._dwell_and_submit(driver, scope, elapsed_time=elapsed_solving)
+        self._dwell_and_submit(
+            driver,
+            scope,
+            elapsed_time=elapsed_solving,
+            target_dwell_override=dwell_seconds,
+            skip_submit=skip_submit,
+        )
         return True
 
     def _solve_choices(self, driver, scope) -> int:
@@ -326,19 +351,44 @@ class WeLearnQuestionSolver:
 
         return handled_count
 
-    def _dwell_and_submit(self, driver, scope, elapsed_time: float = 0.0) -> None:
+    def _dwell_and_submit(
+        self,
+        driver,
+        scope,
+        elapsed_time: float = 0.0,
+        target_dwell_override: Optional[float] = None,
+        skip_submit: bool = False,
+    ) -> None:
         """Dynamic dwell time deduction and SCORM native submission."""
-        target_dwell = max(0, int(self.config.min_dwell_seconds))
+        if target_dwell_override is not None:
+            target_dwell = max(0.0, float(target_dwell_override))
+        else:
+            target_dwell = max(0.0, float(self.config.min_dwell_seconds))
+
         remaining_wait = max(0.0, float(target_dwell) - float(elapsed_time))
 
         if target_dwell > 0:
             if remaining_wait > 0.1:
-                self.log(f"   需补齐要求时长，等待 {remaining_wait:.1f} 秒 (目标 {target_dwell}s, 已答题 {elapsed_time:.1f}s)...")
+                self.log(
+                    f"   需补齐分配时长，等待 {remaining_wait:.1f} 秒 (目标 {target_dwell:.1f}s, 已耗时 {elapsed_time:.1f}s)..."
+                )
                 time.sleep(remaining_wait)
             else:
-                self.log(f"   答题耗时 {elapsed_time:.1f}s 已满足要求时长 ({target_dwell}s)，无需额外停留。")
+                self.log(f"   答题耗时 {elapsed_time:.1f}s 已满足分配时长 ({target_dwell:.1f}s)，无需额外停留。")
 
-        # Locate submit button
+        if skip_submit:
+            self.log("   [纯挂时长/解耦阶段] 跳过重复点击提交按钮。")
+            return
+
+        self.submit_sco_in_scope(driver, scope)
+
+    def submit_sco(self, driver, scoid: str) -> bool:
+        """Locate SCO scope and trigger native SCORM submission."""
+        scope = self.locate_sco_scope(driver, scoid)
+        return self.submit_sco_in_scope(driver, scope)
+
+    def submit_sco_in_scope(self, driver, scope) -> bool:
+        """Click submit button inside the given scope and confirm dialogs safely."""
         submit_selectors = [
             '[data-controltype="submit"]',
             'button[data-controltype="submit"]',
@@ -363,6 +413,17 @@ class WeLearnQuestionSolver:
 
         if submit_btn:
             self.log("   点击页面提交按钮 [data-controltype='submit']...")
+            try:
+                # Bypass courseware layui layer confirmEx dialogs
+                driver.execute_script("""
+                window.confirmEx = function(title, defaultTitle, yesF, noF) {
+                    if (yesF) yesF();
+                };
+                window.CONFIRM_AUTO_CALL = [{title: "", action: true}];
+                """)
+            except Exception:
+                pass
+
             WebDriverHelper.safe_click(driver, submit_btn)
             time.sleep(0.8)
 
@@ -377,7 +438,9 @@ class WeLearnQuestionSolver:
                 pass
 
             try:
-                confirm_btns = driver.find_elements(By.CSS_SELECTOR, '.btn_confirm, .dialog_ok, .btn_ok')
+                confirm_btns = driver.find_elements(
+                    By.CSS_SELECTOR, '.btn_confirm, .dialog_ok, .btn_ok, .layui-layer-btn0'
+                )
                 for cb in confirm_btns:
                     if cb.is_displayed():
                         WebDriverHelper.safe_click(driver, cb)
@@ -385,7 +448,9 @@ class WeLearnQuestionSolver:
             except Exception:
                 pass
 
-            time.sleep(1.0)
+            time.sleep(0.6)
             self.log("   已完成原生提交，SCORM 状态已同步。")
+            return True
         else:
-            self.log("   未在当前小节中发现提交按钮（可能为纯阅读或自动保存小节）。")
+            self.log("   未在当前小节中发现提交按钮（可能为纯阅读、自动保存或受限语音小节）。")
+            return False

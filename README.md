@@ -33,9 +33,13 @@
 ### 2. LLM 智能兜底主观题
 - **开放简答与长填空 (`div[data-controltype="fillinglong"]`)**：针对无原生标准答案的主观写作与思考题，自动向上回溯提取所在 `.white_frame`、题目说明 `.direction` 及课文背景材料，调用 OpenAI 兼容接口（如 `gpt-4o-mini` / `deepseek-chat` / `kimi-k2-turbo-preview`）生成规范英语回答并填入。
 
-### 3. SCORM 2004 原生提交流程（防对账清零）
-- **杜绝纯 HTTP 伪造包**：旧版脚本直接向 `/Ajax/SCO.aspx` 发送 `session_time: 0` 的虚假数据包会导致次日被平台后台审计对账清零。
-- **外壳与 iframe 上下文切换器**：通过 `WeLearnFrameContext` 安全切入 `<iframe id="contentFrame">`，在小节专属容器 `li[data-scoid="{scoid}"]` 内真实作答，并强制保持合理的真实停留时间（`min_dwell_seconds`），最后点击课件原生提交按钮 `[data-controltype="submit"]`，触发外壳页 `window.API_1484_11` (SCORM LMS 运行时) 真实判分与数据同步。
+### 3. SCORM 2004 原生提交流程与防风控并发架构
+- **杜绝纯 HTTP 伪造包**：旧版脚本直接向 `/Ajax/SCO.aspx` 发送全量无上限协程并发或 `session_time: 0` 的静态数据包，极易触发平台时间流速审计与次日对账清零。
+- **目标总时长智能分摊 (`DurationPlanner`)**：支持设定课程/选中范围的「目标总时长 (`target_total_seconds`)」，自动读取并扣除各小节已有 `learntime`，将净差额时长以非均匀随机权重（$\pm 35\%$ 抖动）分配至各个选中任务，既避免单单元时长畸高，又保证累计总时长精准达标。
+- **三种可选执行与防封控并发模式 (`concurrency_mode`)**：
+  1. **`serial`（串联顺序模式）**：单标签页按目录顺序逐个完成作答、停留与原生提交（基线模式）。
+  2. **`decoupled`（答题/挂机解耦并发模式）**：阶段 1 在主标签页单线程按顺序快速完成题目作答与提交（确保服务端 `submit_time` 时间轴 100% 串行无重叠）；阶段 2 开启多标签页池并发打开小节纯挂原生心跳补齐时长，不重复点击提交按钮。
+  3. **`pipeline`（错峰流水线并发模式）**：开启 $2 \sim 4$ 个真实浏览器标签页并行加载小节、DOM 作答并同时挂时长，配合 **「错峰发车 + 保序提交互斥锁（Submission Gate）」** 强制按目录顺序单调递增提交并保持安全间隔。
 
 ---
 
@@ -58,7 +62,8 @@ WeLearn-DOM-Helper/
 ├── config.example.json     # 配置文件范式
 ├── requirements.txt        # 依赖清单
 ├── LICENSE                 # GNU AGPLv3 许可证全文
-├── start.sh / start.bat    # 启动脚本
+├── config.sh / config.command / config.bat # 独立配置编辑器启动脚本 (Linux/macOS/Windows)
+├── start.sh / start.command / start.bat    # 主程序启动脚本 (Linux/macOS/Windows)
 └── tests/                  # 单元与集成测试套件
 ```
 
@@ -88,8 +93,11 @@ uv pip install -r requirements.txt  # 或 pip install -r requirements.txt
 可以运行配置编辑器图形界面，或从范式复制配置文件：
 
 ```bash
-# 启动配置编辑器 GUI
-./config.sh  # 或 python config_editor.py
+# 启动独立配置编辑器 GUI
+./config.sh         # Linux / macOS 终端
+# 或在 macOS Finder 中直接双击运行 config.command
+# 或在 Windows 文件资源管理器中直接双击运行 config.bat
+python config_editor.py
 ```
 
 或手动编辑 `config.json`：

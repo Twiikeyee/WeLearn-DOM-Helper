@@ -191,3 +191,31 @@ class WeLearnAPI:
                     )
                 )
         return scos
+
+    @staticmethod
+    def normalize_cdn_addr(addr: str) -> str:
+        """Convert raw scoAddr string ('//centercourseware...|Location') into clean https URL."""
+        if not addr:
+            return ""
+        clean = str(addr).split("|")[0].strip()
+        if not clean:
+            return ""
+        if clean.startswith("//"):
+            return "https:" + clean
+        if clean.startswith("http://") or clean.startswith("https://"):
+            return clean
+        return f"https://centercourseware.sflep.com/{clean.lstrip('/')}"
+
+    @classmethod
+    def get_sco_cdn_url(cls, driver, cid: str, uid: str, scoid: str) -> str:
+        """Fetch static CDN courseware URL for a given SCO via action=scoAddr."""
+        url = f"{AJAX_BASE}/Ajax/SCO.aspx?uid={uid}"
+        res = cls.execute_browser_fetch(
+            driver,
+            url,
+            method="POST",
+            body={"action": "scoAddr", "cid": cid, "scoid": scoid},
+        )
+        if isinstance(res, dict):
+            return cls.normalize_cdn_addr(str(res.get("addr", "") or ""))
+        return ""

@@ -26,9 +26,12 @@ class Config:
     password: str = ""
     url: str = DEFAULT_WELEARN_URL
     
-    # Typing & Speed
+    # Typing & Speed & Concurrency
     typing_mode: str = "fast"  # "fast" (instant JS injection) or "simulate" (human keystrokes)
-    min_dwell_seconds: int = 0  # 0 for max speed, or set > 0 if teacher requires minimum study time
+    min_dwell_seconds: int = 0  # 0 for max speed, or set > 0 if teacher requires minimum study time per SCO
+    concurrency_mode: str = "serial"  # "serial", "decoupled" (serial answer + concurrent dwell), or "pipeline" (staggered multi-tab)
+    target_total_seconds: int = 0  # 0 to disable; > 0 to auto-deduct learned time and randomly distribute across tasks
+    max_concurrent_tabs: int = 3  # Number of concurrent browser tabs (2~4 recommended) for decoupled/pipeline modes
     
     # LLM Settings
     enable_llm_subjective: bool = False  # False for 0-token free mode with default template
@@ -65,12 +68,19 @@ class Config:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        raw_mode = str(data.get("concurrency_mode", "serial") or "serial").strip().lower()
+        if raw_mode not in ("serial", "decoupled", "pipeline"):
+            raw_mode = "serial"
+
         return cls(
             username=str(data.get("username", "") or "").strip(),
             password=str(data.get("password", "") or "").strip(),
             url=str(data.get("url", "") or DEFAULT_WELEARN_URL).strip(),
             typing_mode=str(data.get("typing_mode", "fast") or "fast").strip().lower(),
-            min_dwell_seconds=int(data.get("min_dwell_seconds", 0)),
+            min_dwell_seconds=max(0, int(data.get("min_dwell_seconds", 0) or 0)),
+            concurrency_mode=raw_mode,
+            target_total_seconds=max(0, int(data.get("target_total_seconds", 0) or 0)),
+            max_concurrent_tabs=max(1, min(8, int(data.get("max_concurrent_tabs", 3) or 3))),
             enable_llm_subjective=bool(data.get("enable_llm_subjective", False)),
             subjective_default_text=str(
                 data.get("subjective_default_text", DEFAULT_SUBJECTIVE_TEXT) or DEFAULT_SUBJECTIVE_TEXT
@@ -95,6 +105,9 @@ class Config:
             "url": self.url,
             "typing_mode": self.typing_mode,
             "min_dwell_seconds": self.min_dwell_seconds,
+            "concurrency_mode": self.concurrency_mode,
+            "target_total_seconds": self.target_total_seconds,
+            "max_concurrent_tabs": self.max_concurrent_tabs,
             "enable_llm_subjective": self.enable_llm_subjective,
             "subjective_default_text": self.subjective_default_text,
             "api_key": self.api_key,
