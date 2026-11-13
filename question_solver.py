@@ -54,12 +54,37 @@ class WeLearnQuestionSolver:
             logger.info(message)
 
     def _fill_text(self, driver, element, text: str) -> None:
-        """Dispatch text input according to typing_mode (fast vs simulate)."""
+        """Dispatch text input according to typing_mode (fast vs simulate) and sync jQuery values."""
         mode = getattr(self.config, "typing_mode", "fast").lower()
-        if mode == "simulate":
+        is_readonly = bool(element.get_attribute("readonly") or element.get_attribute("data-alwaysreadonly"))
+        if mode == "simulate" and not is_readonly:
             WebDriverHelper.simulate_typing(driver, element, text)
         else:
             WebDriverHelper.fast_fill(driver, element, text)
+
+        # Sync WeLearn jQuery values and myresult display if present
+        try:
+            driver.execute_script(
+                """
+                var el = arguments[0];
+                var val = arguments[1];
+                var $ = window.jQuery || window.$;
+                if ($) {
+                    var $parent = $(el).closest('[data-controltype]');
+                    if ($parent.length > 0 && typeof $parent.values === 'function') {
+                        $parent.values(val);
+                    }
+                    var $myres = $parent.find('[data-itemtype="myresult"]');
+                    if ($myres.length > 0) {
+                        $myres.text(val);
+                    }
+                }
+                """,
+                element,
+                str(text),
+            )
+        except Exception:
+            pass
 
     def locate_sco_scope(self, driver, scoid: str):
         """Locate the section page container strictly bounded by data-scoid."""
@@ -104,13 +129,16 @@ class WeLearnQuestionSolver:
         # Step 1: Solve Choice Questions (div[data-controltype="choice"])
         choice_count = self._solve_choices(driver, scope)
 
-        # Step 2: Solve Objective Short Fill-in (div[data-controltype="filling"])
-        filling_count = self._solve_objective_fillings(driver, scope)
+        # Step 2: Solve Banked Cloze / ChooseBox (.ChooseBox, [data-choosebox])
+        choosebox_count = self._solve_choosebox_fillings(driver, scope)
 
-        # Step 3: Solve Subjective Long Fill-in / Open Essay (div[data-controltype="fillinglong"])
+        # Step 3: Solve Objective Short Fill-in (div[data-controltype="filling"])
+        filling_count = self._solve_objective_fillings(driver, scope) + choosebox_count
+
+        # Step 4: Solve Subjective Long Fill-in / Open Essay (div[data-controltype="fillinglong"])
         subjective_count = self._solve_subjective_fillings(driver, scope)
 
-        # Step 4: Handle Audio / Record elements
+        # Step 5: Handle Audio / Record elements
         record_count = self._handle_audio_records(driver, scope)
 
         elapsed_solving = time.time() - start_time
@@ -202,6 +230,86 @@ class WeLearnQuestionSolver:
 
         return solved_count
 
+    def _solve_choosebox_fillings(self, driver, scope) -> int:
+        """Extract and solve banked cloze (选词填空) within ChooseBox containers."""
+        try:
+            script = """
+            var scope = arguments[0];
+            var $ = window.jQuery || window.$;
+            if (!$) return [];
+
+            var $scope = $(scope);
+            var $boxes = $scope.find('.ChooseBox, [data-choosebox]');
+            if ($boxes.length === 0) {
+                var $hasMyRes = $scope.find('div[data-controltype="filling"]').filter(function() {
+                    return $(this).find('[data-itemtype="myresult"]').length > 0 ||
+                           $(this).find('input[data-alwaysreadonly]').length > 0;
+                });
+                if ($hasMyRes.length > 0) {
+                    $boxes = $scope;
+                }
+            }
+            if ($boxes.length === 0) return [];
+
+            var results = [];
+            // Clear unsubmitChecked in answer sheet
+            $scope.find('.ChooseSheet_cell li').removeClass('unsubmitChecked');
+
+            $boxes.find('div[data-controltype="filling"]').each(function() {
+                var $t = $(this);
+                // Mark this element so ordinary fill doesn't overwrite it
+                $t.attr('data-processed-by-helper', 'true');
+                $t.find('input').attr('data-processed-by-helper', 'true');
+
+                var sol = $t.find('[data-solution]').attr('data-solution') ||
+                          $t.attr('data-solution');
+                if (!sol) {
+                    var $res = $t.find('[data-itemtype="result"]');
+                    if ($res.length > 0) sol = $res.text();
+                }
+
+                if (sol) {
+                    sol = $.trim(sol.split('/')[0]);
+
+                    // 1. Invoke WeLearn's jQuery plugin values() method
+                    if (typeof $t.values === 'function') {
+                        $t.values(sol);
+                    }
+
+                    // 2. Set input value and dispatch events
+                    var $inp = $t.find('input');
+                    if ($inp.length > 0) {
+                        $inp.val(sol).trigger('change').trigger('input');
+                    }
+
+                    // 3. Set visible myresult text
+                    var $myres = $t.find('[data-itemtype="myresult"]');
+                    if ($myres.length > 0) {
+                        $myres.text(sol);
+                    }
+
+                    // 4. Mark corresponding word in AnswerSheet
+                    $scope.find('.ChooseSheet_cell li').each(function() {
+                        var txt = $.trim($(this).text()).toLowerCase();
+                        if (txt === sol.toLowerCase()) {
+                            $(this).addClass('unsubmitChecked');
+                        }
+                    });
+
+                    results.push(sol);
+                }
+            });
+            return results;
+            """
+            solved_answers = driver.execute_script(script, scope)
+            if solved_answers:
+                for idx, ans in enumerate(solved_answers):
+                    self.log(f"   [选词填空 {idx+1}] 命中并填入 DOM 原生答案: '{ans}'")
+                return len(solved_answers)
+        except Exception as e:
+            logger.debug("Error solving choosebox fillings: %s", e)
+        return 0
+
     def _solve_objective_fillings(self, driver, scope) -> int:
         """Extract and solve short fill-in inputs using DOM data-solution or result."""
         try:
@@ -217,6 +325,9 @@ class WeLearnQuestionSolver:
         solved_count = 0
         for idx, inp in enumerate(inputs):
             try:
+                # Skip if already processed by ChooseBox solver or readonly
+                if inp.get_attribute("data-processed-by-helper") or inp.get_attribute("data-alwaysreadonly"):
+                    continue
                 solution = inp.get_attribute("data-solution")
 
                 if not solution:
@@ -389,6 +500,29 @@ class WeLearnQuestionSolver:
 
     def submit_sco_in_scope(self, driver, scope) -> bool:
         """Click submit button inside the given scope and confirm dialogs safely."""
+        try:
+            # Prepare submit buttons: unhide, unlock re-submission & auto-confirm LayUI
+            driver.execute_script("""
+            var sc = arguments[0];
+            var $ = window.jQuery || window.$;
+            if ($) {
+                var $sc = $(sc);
+                var $btns = $sc.find('[data-controltype="submit"], [data-controltype="mirrorcmd"], .cmd_submit');
+                $btns.each(function() {
+                    $(this).removeAttr('data-submitted');
+                    $(this).attr('data-submittednotlock', '');
+                    $(this).attr('data-ignoresubmitcheck', '');
+                    $(this).show();
+                });
+            }
+            window.confirmEx = function(title, defaultTitle, yesF, noF) {
+                if (yesF) yesF();
+            };
+            window.CONFIRM_AUTO_CALL = [{title: "", action: true}];
+            """, scope)
+        except Exception:
+            pass
+
         submit_selectors = [
             '[data-controltype="submit"]',
             'button[data-controltype="submit"]',

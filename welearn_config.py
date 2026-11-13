@@ -12,6 +12,10 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+DEFAULT_EXAMPLE_PATH = os.path.join(BASE_DIR, "config.example.json")
+
 DEFAULT_WELEARN_URL = "https://welearn.sflep.com/2019/student/index.aspx"
 DEFAULT_SUBJECTIVE_TEXT = (
     "From my perspective, this viewpoint is quite reasonable and closely "
@@ -53,9 +57,10 @@ class Config:
     tts_proxy: str = ""
 
     @classmethod
-    def from_json(cls, path: str = "config.json") -> "Config":
+    def from_json(cls, path: Optional[str] = None) -> "Config":
+        path = path or DEFAULT_CONFIG_PATH
         if not os.path.exists(path):
-            example_path = "config.example.json"
+            example_path = DEFAULT_EXAMPLE_PATH
             if os.path.exists(example_path):
                 try:
                     with open(example_path, "r", encoding="utf-8") as f:
@@ -123,6 +128,7 @@ class Config:
             "tts_proxy": self.tts_proxy,
         }
 
-    def save_json(self, path: str = "config.json") -> None:
+    def save_json(self, path: Optional[str] = None) -> None:
+        path = path or DEFAULT_CONFIG_PATH
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)

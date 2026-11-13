@@ -13,7 +13,6 @@ import os
 import queue
 import sys
 import threading
-import time
 
 from fluent_ui import FluentModernGUI
 from welearn_bot import WeLearnBot
@@ -74,12 +73,22 @@ def main():
         gui_log_queue.put("正在启动浏览器并连接 WeLearn 平台...")
         try:
             bot.start_driver()
+        except Exception as e:
+            gui_log_queue.put(f"浏览器启动异常: {e}")
+            logger.error("Startup error: %s", e, exc_info=True)
+            gui.notify_driver_state(False)
+            return
+
+        gui.notify_driver_state(bot.driver is not None)
+        try:
             logged_in = bot.check_or_prompt_login()
+            gui.notify_login_state(bool(logged_in))
             if logged_in:
                 gui_log_queue.put("登录就绪！点击【扫描任务列表】即可加载全部单元与小节任务。")
         except Exception as e:
-            gui_log_queue.put(f"启动或登录异常: {e}")
-            logger.error("Startup error: %s", e, exc_info=True)
+            gui_log_queue.put(f"登录检测异常: {e}")
+            logger.error("Login check error: %s", e, exc_info=True)
+            gui.notify_login_state(False)
 
     # Launch driver & login watcher in background thread
     startup_thread = threading.Thread(target=background_startup, daemon=True)
