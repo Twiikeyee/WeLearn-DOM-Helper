@@ -33,6 +33,19 @@ class SubmitButtonTests(unittest.TestCase):
         scope.find_elements.side_effect = lambda by, sel: [button] if sel == '[data-controltype="submit"]' else []
         self.assertIs(WeLearnQuestionSolver.find_submit_button(scope), button)
 
+    def test_prefers_interactive_button_over_div_wrapper(self):
+        wrapper_div = self.element('Submit')
+        button = self.element('Submit')
+        scope = MagicMock()
+        def find(by, sel):
+            if sel.startswith('button, input'):
+                return [button]
+            if sel == 'div, span':
+                return [wrapper_div]
+            return []
+        scope.find_elements.side_effect = find
+        self.assertIs(WeLearnQuestionSolver.find_submit_button(scope), button)
+
 
 if __name__ == '__main__':
     unittest.main()

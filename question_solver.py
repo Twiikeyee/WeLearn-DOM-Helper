@@ -199,18 +199,10 @@ class WeLearnQuestionSolver:
     @staticmethod
     def _et_choice_state(driver, element):
         """Read the Angular component state after it removes the original key attribute."""
-        return driver.execute_script("""
-            var element = arguments[0];
-            if (!window.angular) return null;
-            var wrapped = window.angular.element(element);
-            var ctrl = wrapped.controller('etChoice');
-            if (!ctrl) {
-                var scope = wrapped.isolateScope && wrapped.isolateScope();
-                ctrl = scope && scope.choice;
-            }
-            if (!ctrl || !ctrl.hasKey || !Array.isArray(ctrl.key) || !Array.isArray(ctrl.value)) return null;
-            return {key: ctrl.key.slice(), value: ctrl.value.slice()};
-        """, element)
+        state = WeLearnQuestionSolver._et_component_state(driver, element, 'etChoice', 'choice')
+        if not isinstance(state, dict) or not isinstance(state.get('value'), list):
+            return None
+        return state
 
     def _solve_et_choices(self, driver, scope):
         """Solve Angular et-choice controls using their component's native answer key."""
@@ -717,21 +709,28 @@ class WeLearnQuestionSolver:
                 continue
 
         if not submit_btn:
-            try:
-                candidates = scope.find_elements(
-                    By.CSS_SELECTOR, 'button, input[type="submit"], input[type="button"], a, [role="button"], div, span'
-                )
-                for button in candidates:
-                    if not button.is_displayed() or not button.is_enabled():
-                        continue
-                    labels = (button.text, button.get_attribute("value"),
-                              button.get_attribute("aria-label"), button.get_attribute("title"))
-                    if any(re.sub(r"\s+", " ", str(label or "")).strip().casefold()
-                           in {"submit", "提交", "提交答案"} for label in labels):
-                        submit_btn = button
+            # Prefer real interactive controls before falling back to generic div/span wrappers.
+            fallback_selectors = (
+                'button, input[type="submit"], input[type="button"], a, [role="button"]',
+                'div, span',
+            )
+            submit_labels = {"submit", "提交", "提交答案"}
+            for sel in fallback_selectors:
+                try:
+                    candidates = scope.find_elements(By.CSS_SELECTOR, sel)
+                    for button in candidates:
+                        if not button.is_displayed() or not button.is_enabled():
+                            continue
+                        labels = (button.text, button.get_attribute("value"),
+                                  button.get_attribute("aria-label"), button.get_attribute("title"))
+                        if any(re.sub(r"\s+", " ", str(label or "")).strip().casefold()
+                               in submit_labels for label in labels):
+                            submit_btn = button
+                            break
+                    if submit_btn:
                         break
-            except Exception as e:
-                logger.debug("Error finding submit button by label: %s", e)
+                except Exception as e:
+                    logger.debug("Error finding submit button by label (%s): %s", sel, e)
 
         return submit_btn
 
