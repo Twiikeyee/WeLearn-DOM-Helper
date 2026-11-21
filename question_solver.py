@@ -128,12 +128,17 @@ class WeLearnQuestionSolver:
 
         # Step 1: Solve Choice Questions (div[data-controltype="choice"])
         choice_count = self._solve_choices(driver, scope)
+        et_solved, et_total = self._solve_et_choices(driver, scope)
+        choice_count += et_solved
+        tof_solved, tof_total = self._solve_et_tof(driver, scope)
 
         # Step 2: Solve Banked Cloze / ChooseBox (.ChooseBox, [data-choosebox])
         choosebox_count = self._solve_choosebox_fillings(driver, scope)
 
         # Step 3: Solve Objective Short Fill-in (div[data-controltype="filling"])
         filling_count = self._solve_objective_fillings(driver, scope) + choosebox_count
+        blank_solved, blank_total = self._solve_et_blanks(driver, scope)
+        filling_count += blank_solved
 
         # Step 4: Solve Subjective Long Fill-in / Open Essay (div[data-controltype="fillinglong"])
         subjective_count = self._solve_subjective_fillings(driver, scope)
@@ -142,9 +147,9 @@ class WeLearnQuestionSolver:
         record_count = self._handle_audio_records(driver, scope)
 
         elapsed_solving = time.time() - start_time
-        is_voice_only = (record_count > 0) and (choice_count + filling_count + subjective_count == 0)
+        is_voice_only = (record_count > 0) and (choice_count + tof_solved + filling_count + subjective_count == 0)
         self.log(
-            f"   作答统计: 选择 {choice_count} 道, 填空 {filling_count} 道, "
+            f"   作答统计: 选择 {choice_count} 道, 判断 {tof_solved} 道, 填空 {filling_count} 道, "
             f"主观题 {subjective_count} 道, 语音/录音 {record_count} 道 (耗时 {elapsed_solving:.1f} 秒)"
         )
         if is_voice_only:
@@ -153,6 +158,11 @@ class WeLearnQuestionSolver:
         return {
             "scoid": scoid,
             "choice_count": choice_count,
+            "et_choice_total": et_total,
+            "et_choice_unresolved": et_total - et_solved,
+            "tof_count": tof_solved,
+            "et_tof_unresolved": tof_total - tof_solved,
+            "et_blank_unresolved": blank_total - blank_solved,
             "filling_count": filling_count,
             "subjective_count": subjective_count,
             "record_count": record_count,
@@ -172,6 +182,10 @@ class WeLearnQuestionSolver:
         elapsed_solving = stats["elapsed_solving"]
         scope = self.locate_sco_scope(driver, scoid)
 
+        # Do not submit a question page when parsing failed or only some ET choices were filled.
+        if not skip_submit and not self.can_submit_questions(stats, scope):
+            return False
+
         # Step 5: Dynamic dwell time and submission
         self._dwell_and_submit(
             driver,
@@ -180,6 +194,189 @@ class WeLearnQuestionSolver:
             target_dwell_override=dwell_seconds,
             skip_submit=skip_submit,
         )
+        return True
+
+    @staticmethod
+    def _et_choice_state(driver, element):
+        """Read the Angular component state after it removes the original key attribute."""
+        return driver.execute_script("""
+            var element = arguments[0];
+            if (!window.angular) return null;
+            var wrapped = window.angular.element(element);
+            var ctrl = wrapped.controller('etChoice');
+            if (!ctrl) {
+                var scope = wrapped.isolateScope && wrapped.isolateScope();
+                ctrl = scope && scope.choice;
+            }
+            if (!ctrl || !ctrl.hasKey || !Array.isArray(ctrl.key) || !Array.isArray(ctrl.value)) return null;
+            return {key: ctrl.key.slice(), value: ctrl.value.slice()};
+        """, element)
+
+    def _solve_et_choices(self, driver, scope):
+        """Solve Angular et-choice controls using their component's native answer key."""
+        try:
+            choices = [el for el in scope.find_elements(By.CSS_SELECTOR, 'et-choice') if el.is_displayed()]
+        except Exception as e:
+            logger.debug("Error finding et-choice questions: %s", e)
+            self.log("   无法检查课件题目，已停止自动提交。")
+            return 0, 1
+        if not choices:
+            return 0, 0
+
+        # First validate every key so a missing answer does not lead to a partial submission.
+        plan = []
+        for number, choice in enumerate(choices, 1):
+            try:
+                options = choice.find_elements(By.CSS_SELECTOR, 'ol > li, ul > li')
+                if not options:
+                    options = choice.find_elements(By.CSS_SELECTOR, ':scope > .wrapper > span')
+                state = self._et_choice_state(driver, choice)
+                if not isinstance(state, dict):
+                    raise ValueError("页面组件没有提供答案")
+                key, selected = state.get('key'), state.get('value')
+                if (not isinstance(key, list) or not key or not isinstance(selected, list)
+                        or any(type(i) is not int or i < 0 or i >= len(options) for i in key + selected)
+                        or len(set(key)) != len(key)):
+                    raise ValueError("答案格式与选项不匹配")
+                plan.append((number, choice, options, set(key), set(selected)))
+            except Exception as e:
+                self.log(f"   [选择题 {number}] 无法读取课件组件答案: {e}；已停止自动提交。")
+                return 0, len(choices)
+
+        solved = 0
+        for number, choice, options, key, selected in plan:
+            try:
+                # Normal option clicks preserve the courseware's own Angular events.
+                for index in sorted(selected - key):
+                    if not WebDriverHelper.safe_click(driver, options[index]):
+                        raise RuntimeError("取消选项失败")
+                for index in sorted(key - selected):
+                    if not WebDriverHelper.safe_click(driver, options[index]):
+                        raise RuntimeError("点击选项失败")
+                state = self._et_choice_state(driver, choice)
+                if not isinstance(state, dict) or set(state.get('value', [])) != key:
+                    raise RuntimeError("页面未确认选中状态")
+                self.log(f"   [选择题 {number}] 已按课件组件答案选中 {', '.join(chr(65 + i) for i in sorted(key))}")
+                solved += 1
+            except Exception as e:
+                self.log(f"   [选择题 {number}] 作答失败: {e}；已停止自动提交。")
+        return solved, len(choices)
+
+    @staticmethod
+    def _et_component_state(driver, element, component, alias):
+        return driver.execute_script("""
+            var element = arguments[0], component = arguments[1], alias = arguments[2];
+            if (!window.angular) return null;
+            var wrapped = window.angular.element(element);
+            var ctrl = wrapped.controller(component);
+            if (!ctrl) {
+                var scope = wrapped.isolateScope && wrapped.isolateScope();
+                ctrl = scope && scope[alias];
+            }
+            if (!ctrl || !ctrl.hasKey || !Array.isArray(ctrl.key)) return null;
+            return {key: ctrl.key.slice(), value: Array.isArray(ctrl.value) ? ctrl.value.slice() : ctrl.value};
+        """, element, component, alias)
+
+    def _solve_et_tof(self, driver, scope):
+        try:
+            questions = [el for el in scope.find_elements(By.CSS_SELECTOR, 'et-tof') if el.is_displayed()]
+        except Exception as e:
+            logger.debug("Error finding et-tof questions: %s", e)
+            self.log("   无法检查课件题目，已停止自动提交。")
+            return 0, 1
+        plan = []
+        for number, question in enumerate(questions, 1):
+            try:
+                state = self._et_component_state(driver, question, 'etTof', 'tof')
+                options = question.find_elements(By.CSS_SELECTOR, 'span.controls > span')
+                if (not isinstance(state, dict) or len(options) != 2
+                        or not isinstance(state.get('key'), list) or len(state['key']) != 1
+                        or state['key'][0] not in ('t', 'f')
+                        or not isinstance(state.get('value'), list)):
+                    raise ValueError("判断题答案或选项不可用")
+                plan.append((number, question, options, state['key'][0], state['value']))
+            except Exception as e:
+                self.log(f"   [判断题 {number}] 无法读取课件组件答案: {e}；已停止自动提交。")
+                return 0, len(questions)
+        solved = 0
+        for number, question, options, key, selected in plan:
+            try:
+                if selected != [key] and not WebDriverHelper.safe_click(driver, options[0 if key == 't' else 1]):
+                    raise RuntimeError("点击选项失败")
+                state = self._et_component_state(driver, question, 'etTof', 'tof')
+                if not isinstance(state, dict) or state.get('value') != [key]:
+                    raise RuntimeError("页面未确认选中状态")
+                self.log(f"   [判断题 {number}] 已按课件组件答案选中 {key.upper()}")
+                solved += 1
+            except Exception as e:
+                self.log(f"   [判断题 {number}] 作答失败: {e}；已停止自动提交。")
+        return solved, len(questions)
+
+    @staticmethod
+    def _commit_et_blank(driver, input_element, answer):
+        """Write and commit via Angular ngModel, including its debounced textarea model."""
+        return driver.execute_script("""
+            var el = arguments[0], value = arguments[1];
+            if (!window.angular) return false;
+            var wrapped = window.angular.element(el);
+            var model = wrapped.controller('ngModel');
+            var scope = wrapped.scope();
+            if (!scope && wrapped.injector()) scope = wrapped.injector().get('$rootScope');
+            if (!model || !scope) return false;
+            var commit = function() {
+                model.$setViewValue(value);
+                model.$commitViewValue();
+                model.$render();
+            };
+            if (scope.$root.$$phase) commit(); else scope.$apply(commit);
+            return true;
+        """, input_element, answer)
+
+    def _solve_et_blanks(self, driver, scope):
+        try:
+            questions = [el for el in scope.find_elements(By.CSS_SELECTOR, 'et-blank') if el.is_displayed()]
+        except Exception as e:
+            logger.debug("Error finding et-blank questions: %s", e)
+            self.log("   无法检查课件题目，已停止自动提交。")
+            return 0, 1
+        plan = []
+        for number, question in enumerate(questions, 1):
+            try:
+                state = self._et_component_state(driver, question, 'etBlank', 'blank')
+                fields = question.find_elements(By.CSS_SELECTOR, 'textarea.blank, input.blank, [contenteditable].blank')
+                fields = [field for field in fields if field.is_displayed() and field.is_enabled()]
+                keys = state.get('key') if isinstance(state, dict) else None
+                if not fields or not isinstance(keys, list):
+                    raise ValueError("未找到可编辑输入框或组件答案")
+                answer = next((key.strip() for key in keys if isinstance(key, str) and key.strip()), None)
+                if not answer:
+                    raise ValueError("组件没有提供参考答案")
+                plan.append((number, question, fields[0], answer))
+            except Exception as e:
+                self.log(f"   [问答题 {number}] 无法读取课件组件答案: {e}；已停止自动提交。")
+                return 0, len(questions)
+        solved = 0
+        for number, question, field, answer in plan:
+            try:
+                if not self._commit_et_blank(driver, field, answer):
+                    raise RuntimeError("无法同步 Angular 输入状态")
+                state = self._et_component_state(driver, question, 'etBlank', 'blank')
+                if not isinstance(state, dict) or state.get('value') != answer:
+                    raise RuntimeError("页面未确认填写状态")
+                self.log(f"   [问答题 {number}] 已填入课件组件中的参考答案")
+                solved += 1
+            except Exception as e:
+                self.log(f"   [问答题 {number}] 作答失败: {e}；已停止自动提交。")
+        return solved, len(questions)
+
+    def can_submit_questions(self, stats, scope):
+        if any(stats.get(k, 0) for k in ('et_choice_unresolved', 'et_tof_unresolved', 'et_blank_unresolved')):
+            self.log("   课件题目未全部完成，已停止自动提交。")
+            return False
+        answered = sum(stats.get(k, 0) for k in ('choice_count', 'tof_count', 'filling_count', 'subjective_count', 'record_count'))
+        if answered == 0 and self.find_submit_button(scope):
+            self.log("   检测到提交按钮但未识别到题目，已停止自动提交，请检查课件结构。")
+            return False
         return True
 
     def _solve_choices(self, driver, scope) -> int:
@@ -498,6 +695,46 @@ class WeLearnQuestionSolver:
         scope = self.locate_sco_scope(driver, scoid)
         return self.submit_sco_in_scope(driver, scope)
 
+    @staticmethod
+    def find_submit_button(scope):
+        # Prefer known courseware controls, then match visible button labels.
+        submit_selectors = (
+            '[data-controltype="submit"]', 'et-button[action="item.submit()"] button',
+            '.cmd_submit', '.btn_submit', '#btn_submit',
+        )
+        submit_btn = None
+        for sel in submit_selectors:
+            try:
+                buttons = scope.find_elements(By.CSS_SELECTOR, sel)
+                visible = [button for button in buttons if button.is_displayed()]
+                if visible:
+                    submit_btn = visible[0]
+                    break
+                if buttons:
+                    submit_btn = buttons[0]
+                    break
+            except Exception:
+                continue
+
+        if not submit_btn:
+            try:
+                candidates = scope.find_elements(
+                    By.CSS_SELECTOR, 'button, input[type="submit"], input[type="button"], a, [role="button"], div, span'
+                )
+                for button in candidates:
+                    if not button.is_displayed() or not button.is_enabled():
+                        continue
+                    labels = (button.text, button.get_attribute("value"),
+                              button.get_attribute("aria-label"), button.get_attribute("title"))
+                    if any(re.sub(r"\s+", " ", str(label or "")).strip().casefold()
+                           in {"submit", "提交", "提交答案"} for label in labels):
+                        submit_btn = button
+                        break
+            except Exception as e:
+                logger.debug("Error finding submit button by label: %s", e)
+
+        return submit_btn
+
     def submit_sco_in_scope(self, driver, scope) -> bool:
         """Click submit button inside the given scope and confirm dialogs safely."""
         try:
@@ -523,30 +760,10 @@ class WeLearnQuestionSolver:
         except Exception:
             pass
 
-        submit_selectors = [
-            '[data-controltype="submit"]',
-            'button[data-controltype="submit"]',
-            'a[data-controltype="submit"]',
-            'input[data-controltype="submit"]',
-            '.btn_submit',
-            '#btn_submit',
-        ]
-        submit_btn = None
-        for sel in submit_selectors:
-            try:
-                buttons = scope.find_elements(By.CSS_SELECTOR, sel)
-                visible = [b for b in buttons if b.is_displayed()]
-                if visible:
-                    submit_btn = visible[0]
-                    break
-                elif buttons:
-                    submit_btn = buttons[0]
-                    break
-            except Exception:
-                continue
+        submit_btn = self.find_submit_button(scope)
 
         if submit_btn:
-            self.log("   点击页面提交按钮 [data-controltype='submit']...")
+            self.log("   点击当前小节的提交按钮...")
             try:
                 # Bypass courseware layui layer confirmEx dialogs
                 driver.execute_script("""
@@ -583,7 +800,7 @@ class WeLearnQuestionSolver:
                 pass
 
             time.sleep(0.6)
-            self.log("   已完成原生提交，SCORM 状态已同步。")
+            self.log("   已点击提交按钮，请在平台检查完成状态。")
             return True
         else:
             self.log("   未在当前小节中发现提交按钮（可能为纯阅读、自动保存或受限语音小节）。")

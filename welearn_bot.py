@@ -607,7 +607,9 @@ class WeLearnBot:
                         self._ui_log(f"   警告: 无法切入课件上下文，跳过该小节: {scoid}")
                         continue
 
-                    self.solver.solve_sco(self.driver, scoid, dwell_seconds=dwell_sec)
+                    if not self.solver.solve_sco(self.driver, scoid, dwell_seconds=dwell_sec):
+                        self._ui_log(f"   小节未自动提交: {scoid}")
+                        continue
 
                 WeLearnPlayer.flush_shell_sco(self.driver)
                 self._mark_tab_done(tab, on_task_done)
@@ -712,6 +714,10 @@ class WeLearnBot:
 
                             stats = self.solver.fill_sco_questions(self.driver, scoid)
                             elapsed = stats.get("elapsed_solving", 0.0)
+                            scope = self.solver.locate_sco_scope(self.driver, scoid)
+                            if not self.solver.can_submit_questions(stats, scope):
+                                skipped_seqs.add(seq_idx)
+                                continue
 
                         rem_wait = max(0.0, alloc_dwell - elapsed)
                         now_after = time.time()
@@ -836,7 +842,9 @@ class WeLearnBot:
                     if not ctx.entered:
                         self._ui_log(f"   警告: 无法切入课件上下文，跳过: {scoid}")
                         continue
-                    self.solver.solve_sco(self.driver, scoid, dwell_seconds=phase1_wait)
+                    if not self.solver.solve_sco(self.driver, scoid, dwell_seconds=phase1_wait):
+                        self._ui_log(f"   小节未自动提交: {scoid}")
+                        continue
                 WeLearnPlayer.flush_shell_sco(self.driver)
             except Exception as e:
                 self._ui_log(f"   阶段1作答异常 ({scoid}): {e}")
@@ -973,7 +981,9 @@ class WeLearnBot:
                 if not ctx.entered:
                     self._ui_log("未能在当前页面找到课件 iframe (contentFrame)！")
                     return
-                self.solver.solve_sco(self.driver, curr_scoid or "current")
+                if not self.solver.solve_sco(self.driver, curr_scoid or "current"):
+                    self._ui_log("当前页未自动提交，请检查上方提示。")
+                    return
             self._ui_log("当前页快速处理完成！")
         except Exception as e:
             self._ui_log(f"快速处理当前页失败: {e}")
